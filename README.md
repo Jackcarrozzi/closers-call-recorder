@@ -32,38 +32,62 @@ name with no diarisation guesswork.
 
 ---
 
-## Deploying on Railway
+## Putting it on a free Oracle Cloud server
 
-1. Push this folder to a GitHub repo (or use `railway up` from the Railway CLI).
-2. **New Project → Deploy from GitHub repo**. Railway reads the `Dockerfile`;
-   no build configuration needed.
-3. **Settings → Volumes → add a volume mounted at `/data`.** Without it, a call
-   in progress is lost whenever Railway restarts the container. 5 GB is plenty
-   if `DELETE_LOCAL_AFTER_UPLOAD=true`.
-4. **Variables** → paste in the values from `.env.example`. At minimum
+Oracle's Always Free tier is genuinely free forever, not a trial, and the ARM
+instance it gives you (4 cores, 24 GB RAM) is far beefier than anything you'd
+rent for $5 — big enough to run transcription locally at no cost.
+
+1. **Create the instance.** Oracle Cloud console → Compute → Instances → Create.
+   Image **Ubuntu 24.04**, shape **VM.Standard.A1.Flex** with 4 OCPU / 24 GB.
+   Both are marked "Always Free eligible" — check for that label. Save the SSH
+   key it offers you; you can't get it again.
+2. **SSH in:** `ssh -i your-key ubuntu@YOUR_INSTANCE_IP`
+3. **Install:**
+
+   ```bash
+   sudo apt-get update && sudo apt-get install -y git
+   git clone https://github.com/Jackcarrozzi/closers-call-recorder
+   cd closers-call-recorder
+   sudo bash install.sh
+   ```
+
+   That installs Node, ffmpeg and rclone, creates a locked-down service account,
+   and registers a systemd service that starts on boot and restarts on failure.
+4. **Configure:** `sudo nano /opt/closers-recorder/.env` — at minimum
    `DISCORD_TOKEN`, `WATCH_CATEGORY_NAMES`, `LOG_CHANNEL_ID`.
-5. Deploy, then watch the logs for `logged in as…` followed by
-   `watching N voice channel(s)`.
+5. **Start:** `sudo systemctl start closers-recorder`
 
-There is no HTTP port. Railway may warn about no public domain — ignore it.
+No firewall rules are needed. The bot only makes outbound connections, so
+Oracle's default "block all inbound except SSH" is exactly right.
+
+If the console says the ARM shape is out of capacity, that's Oracle being
+oversubscribed, not a problem with your account — try a different availability
+domain, or retry later. The two AMD micro instances are also Always Free and
+will run the recorder fine; they're just too small for local transcripts.
+
+### Or in a container
+
+The `Dockerfile` builds on both ARM and x86 and needs no configuration. On a
+container host, set `GDRIVE_TOKEN` instead of running `rclone config`, and mount
+a volume at `/data` so a restart doesn't lose a call in progress.
 
 ## Google Drive
 
-rclone can't run its browser dance inside a container, so authorise once on your
-own machine and paste the result in as a variable.
+On the server, run rclone's own setup once as the service account:
 
 ```bash
-# on your PC, with rclone installed (winget install Rclone.Rclone)
-rclone authorize "drive"
+sudo -u closersrec HOME=/var/lib/closers-recorder rclone config
 ```
 
-It opens a browser, you approve, and it prints a token block starting with
-`{"access_token":`. Copy the **whole thing including the braces** into the
-`GDRIVE_TOKEN` variable on Railway, and set:
+Answer: `n` for a new remote → name it **gdrive** → choose **Google Drive** →
+leave client id and secret blank (but read the warning below) → scope **1** →
+`n` to advanced config → `n` to auto config, since you're on a headless box —
+it prints a command to run on your own laptop and asks you to paste the result
+back → `n` to shared drive → `y` to confirm → `q` to quit.
 
-```
-RCLONE_REMOTE=gdrive:Discord Recordings
-```
+Then set `RCLONE_REMOTE=gdrive:Discord Recordings` in `.env`. rclone creates the
+folder on the first upload.
 
 The container assembles the rclone config from that on boot. If the folder
 doesn't exist in your Drive, rclone creates it on the first upload.
@@ -78,18 +102,19 @@ rely on it. Ten minutes in the Google Cloud console avoids that:
    enable **Google Drive API**.
 2. **OAuth consent screen** → External → add yourself as a test user.
 3. **Credentials → Create credentials → OAuth client ID → Desktop app.**
-4. Set `GDRIVE_CLIENT_ID` and `GDRIVE_CLIENT_SECRET` on Railway, and run
-   `rclone authorize "drive" "<client_id>" "<client_secret>"` to get the token.
+4. Give the client ID and secret to `rclone config` when it asks, instead of
+   leaving those blank.
 
 Your own client ID is also considerably faster than the shared one, which is
 rate-limited across every rclone user on earth.
 
 ## Finding your channel and category names
 
-After inviting the bot:
+After inviting the bot and setting `DISCORD_TOKEN`, on the server:
 
 ```bash
-npm run channels
+cd /opt/closers-recorder
+sudo -u closersrec env $(grep -v '^#' .env | xargs) node list-channels.js
 ```
 
 It prints every server, category and voice channel the bot can see, with IDs, and
@@ -120,7 +145,7 @@ the call.
 | `MIN_DURATION_SEC` | `20` | Anything shorter is discarded, so channel-hopping doesn't litter your Drive. |
 | `MAX_SESSION_HOURS` | `6` | A marathon call becomes several parts instead of one unusable file. |
 | `KEEP_USER_TRACKS` | `false` | Also keep each speaker's isolated mp3, for editing. |
-| `DELETE_LOCAL_AFTER_UPLOAD` | `false` | Turn on once you trust the uploads, to keep the volume clear. |
+| `DELETE_LOCAL_AFTER_UPLOAD` | `false` | Turn on once you trust the uploads, to keep the disk clear. |
 | `RETENTION_DAYS` | `0` | Auto-delete local copies after N days. Zero keeps them forever. |
 | `AUDIO_CHANNELS` | `1` | Mono mixdown. `2` for stereo. |
 
@@ -131,10 +156,11 @@ the call.
 - `TRANSCRIBE=openai` with an `OPENAI_API_KEY` — roughly **$0.36 per hour of
   actual speech** (silence is stripped before it's sent, so an hour-long call
   with twenty minutes of talking costs about twelve cents).
-- `TRANSCRIBE=local` runs whisper.cpp on the same container — no API key, no
-  per-minute cost, but it needs a bigger Railway instance and a model file
-  baked into the image, and a long call can take longer to transcribe than it
-  took to record.
+- `TRANSCRIBE=local` runs whisper.cpp on the same box — no API key, no
+  per-minute cost, nothing metered. One command sets it up:
+  `sudo bash setup-whisper.sh`. On Oracle's 4-core ARM instance a one-hour call
+  transcribes in roughly ten minutes with `base.en`, which is free in every
+  sense that matters.
 
 Output looks like:
 
@@ -163,15 +189,15 @@ channels are recorded, and put it somewhere they've actually read. Switching off
 
 | Symptom | Fix |
 | --- | --- |
-| `Discord rejected the bot token` | Regenerate it in the developer portal and update the variable. |
+| `Discord rejected the bot token` | Regenerate it in the developer portal and update `.env`, then `sudo systemctl restart closers-recorder`. |
 | `DisallowedIntents` | Server Members Intent is still off in the portal's Bot tab. |
 | `watching 0 voice channel(s)` | Run `npm run channels`. Is the category name spelled exactly right, and does the bot's role have View + Connect on those channels? |
 | Bot joins but the file is silent | The bot has been server-deafened. Undo that in the server's role settings. |
-| `rclone remote is not reachable` | `GDRIVE_TOKEN` is missing or expired — re-run `rclone authorize "drive"`. |
+| `rclone remote is not reachable` | Re-run `rclone config` as the service account, or `rclone config reconnect gdrive:`. |
 | A call stopped halfway through | Look for `voice connection lost` in the logs, usually a network blip. The bot rejoins and opens a new file. |
-| Volume filling up | Set `DELETE_LOCAL_AFTER_UPLOAD=true` and `RETENTION_DAYS=14`. |
+| Disk filling up | Set `DELETE_LOCAL_AFTER_UPLOAD=true` and `RETENTION_DAYS=14`. |
 
-## Running it locally instead
+## Running it on your own machine instead
 
 ```bash
 npm install
@@ -180,4 +206,4 @@ node --env-file=.env index.js
 ```
 
 Needs Node 20+, ffmpeg and rclone on PATH. The machine has to stay awake — which
-is the whole reason to put it on Railway instead.
+is the whole reason to put it on a server instead.

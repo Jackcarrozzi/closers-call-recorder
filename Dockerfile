@@ -16,7 +16,8 @@ ENV NODE_ENV=production \
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ffmpeg ca-certificates curl unzip \
- && curl -fsSL -o /tmp/rclone.zip https://downloads.rclone.org/rclone-current-linux-amd64.zip \
+ && case "$(dpkg --print-architecture)" in arm64) RCA=arm64 ;; *) RCA=amd64 ;; esac \
+ && curl -fsSL -o /tmp/rclone.zip "https://downloads.rclone.org/rclone-current-linux-${RCA}.zip" \
  && unzip -q /tmp/rclone.zip -d /tmp/rclone \
  && install -m 755 /tmp/rclone/*/rclone /usr/local/bin/rclone \
  && rm -rf /tmp/rclone /tmp/rclone.zip \
