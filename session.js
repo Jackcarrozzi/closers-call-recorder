@@ -53,7 +53,7 @@ export class RecordingSession extends EventEmitter {
     });
 
     try {
-      await entersState(this.connection, VoiceConnectionStatus.Ready, 30_000);
+      await entersState(this.connection, VoiceConnectionStatus.Ready, 15_000);
     } catch (err) {
       // Report the connection's own state too. "timed out" alone doesn't say
       // whether we were refused, disconnected, or never got a UDP path at all.

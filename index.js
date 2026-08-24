@@ -46,6 +46,7 @@ class Slot {
 const slots = config.tokens.map((token, i) => new Slot(i, token));
 const graceTimers = new Map(); // channelId -> timeout
 const joinCooldown = new Map(); // channelId -> ms timestamp; set after a failed join
+const joinInFlight = new Set(); // channelIds we are mid-join on, right now
 const JOIN_COOLDOWN_MS = 30_000;
 let evaluateQueued = false;
 
@@ -169,6 +170,19 @@ async function evaluate() {
 }
 
 async function beginRecording(channel) {
+  // Joining takes seconds, and the scheduler keeps ticking while it does. Without
+  // this guard a slow join stacks up a dozen concurrent attempts on the same
+  // guild, and they trample each other's handshake so none of them ever lands.
+  if (joinInFlight.has(channel.id)) return;
+  joinInFlight.add(channel.id);
+  try {
+    await attemptRecording(channel);
+  } finally {
+    joinInFlight.delete(channel.id);
+  }
+}
+
+async function attemptRecording(channel) {
   const slot = freeSlotFor(channel.guild.id);
   if (!slot) {
     log.warn(
