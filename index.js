@@ -381,6 +381,13 @@ function describeJoinFailure(slot, channel) {
       slot.log.warn('  >> This is a Stage channel. The bot needs to be invited to speak.');
     }
     slot.log.warn(`  bot is server-deafened: ${me?.voice?.serverDeaf ? 'YES - undo that' : 'no'}`);
+    const stale = me?.voice?.channelId;
+    slot.log.warn(
+      `  bot's own voice state: ${stale ? `STALE - Discord thinks it is in ${stale}` : 'clean'}`
+    );
+    if (stale) {
+      slot.log.warn('  >> That ghost session is why the join hangs. It is cleared automatically on the next try.');
+    }
   } catch (err) {
     slot.log.warn(`  (could not inspect the channel: ${err.message})`);
   }

@@ -44,6 +44,23 @@ export class RecordingSession extends EventEmitter {
   async start() {
     await fs.mkdir(this.dir, { recursive: true });
 
+    // A crash or a killed container can leave Discord believing the bot is still
+    // sitting in a voice channel. It then ignores every new connect request and
+    // the handshake dies in "signalling" with no explanation. Clear any stale
+    // voice state of our own before asking to join.
+    const me = this.guild.members.me;
+    if (me?.voice?.channelId) {
+      this.log.warn(
+        `clearing a stale voice session in #${me.voice.channel?.name ?? me.voice.channelId} first`
+      );
+      try {
+        await me.voice.disconnect();
+        await new Promise((r) => setTimeout(r, 1500));
+      } catch (err) {
+        this.log.warn(`could not clear it: ${err.message}`);
+      }
+    }
+
     this.connection = joinVoiceChannel({
       channelId: this.channel.id,
       guildId: this.guild.id,
