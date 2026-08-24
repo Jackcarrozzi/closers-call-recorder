@@ -365,18 +365,26 @@ async function pruneOldSessions() {
 
 // ─── boot ─────────────────────────────────────────────────────────────────
 
-/** login() resolves before the gateway has sent us any guilds. Wait for the real thing. */
+/**
+ * login() resolves before the gateway has sent us any guilds, so waiting on it
+ * alone means enumerating an empty cache. discord.js is renaming this event
+ * from "ready" to "clientReady", so listen for both and take whichever comes.
+ */
 function waitUntilReady(client, timeoutMs = 30_000) {
   if (client.isReady()) return Promise.resolve();
   return new Promise((resolve, reject) => {
+    const done = () => {
+      clearTimeout(timer);
+      client.off('ready', done);
+      client.off('clientReady', done);
+      resolve();
+    };
     const timer = setTimeout(
       () => reject(new Error('the gateway never became ready within 30s')),
       timeoutMs
     );
-    client.once('ready', () => {
-      clearTimeout(timer);
-      resolve();
-    });
+    client.once('ready', done);
+    client.once('clientReady', done);
   });
 }
 
@@ -456,9 +464,14 @@ async function main() {
       scheduleEvaluate();
     });
     slot.client.on('error', (err) => slot.log.warn(`gateway error: ${err.message}`));
-    slot.client.once('ready', (c) => {
-      slot.log.info(`logged in as ${c.user.tag}`);
-    });
+    let announced = false;
+    const announceLogin = () => {
+      if (announced) return; // both event names may fire; say it once
+      announced = true;
+      slot.log.info(`logged in as ${slot.client.user?.tag ?? 'the bot'}`);
+    };
+    slot.client.once('ready', announceLogin);
+    slot.client.once('clientReady', announceLogin);
     try {
       await slot.client.login(slot.token);
       await waitUntilReady(slot.client);
