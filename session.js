@@ -55,9 +55,14 @@ export class RecordingSession extends EventEmitter {
     try {
       await entersState(this.connection, VoiceConnectionStatus.Ready, 30_000);
     } catch (err) {
-      this.connection.destroy();
+      // Report the connection's own state too. "timed out" alone doesn't say
+      // whether we were refused, disconnected, or never got a UDP path at all.
+      const state = this.connection?.state?.status ?? 'unknown';
+      this.#destroyQuietly();
       this.connection = null;
-      throw new Error(`could not join #${this.channel.name}: ${err.message}`);
+      throw new Error(
+        `could not join #${this.channel.name} (voice connection state: ${state}): ${err.message}`
+      );
     }
 
     this.#watchConnection();
@@ -73,6 +78,15 @@ export class RecordingSession extends EventEmitter {
 
     this.log.info(`recording #${this.channel.name} -> ${this.id}`);
     return this;
+  }
+
+  /** destroy() throws if the connection already tore itself down. That is not an error. */
+  #destroyQuietly() {
+    try {
+      if (this.connection && this.connection.state.status !== VoiceConnectionStatus.Destroyed) {
+        this.connection.destroy();
+      }
+    } catch {}
   }
 
   #watchConnection() {
@@ -153,9 +167,7 @@ export class RecordingSession extends EventEmitter {
       await track.close();
     }
 
-    try {
-      this.connection?.destroy();
-    } catch {}
+    this.#destroyQuietly();
     this.connection = null;
 
     const withAudio = [...this.tracks.values()].filter((t) => t.totalBytes > 0);

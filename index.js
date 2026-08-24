@@ -45,6 +45,8 @@ class Slot {
 
 const slots = config.tokens.map((token, i) => new Slot(i, token));
 const graceTimers = new Map(); // channelId -> timeout
+const joinCooldown = new Map(); // channelId -> ms timestamp; set after a failed join
+const JOIN_COOLDOWN_MS = 30_000;
 let evaluateQueued = false;
 
 // ─── channel matching ─────────────────────────────────────────────────────
@@ -125,6 +127,11 @@ async function evaluate() {
     const active = slotRecording(channel.id);
 
     if (people >= config.minHumans && !active) {
+      // A channel we just failed to join gets a rest. Without this, a permission
+      // problem or a blocked voice path turns into hundreds of attempts a minute.
+      const until = joinCooldown.get(channel.id) ?? 0;
+      if (Date.now() < until) continue;
+
       const timer = graceTimers.get(channel.id);
       if (timer) {
         clearTimeout(timer);
@@ -189,8 +196,11 @@ async function beginRecording(channel) {
 
   try {
     await session.start();
+    joinCooldown.delete(channel.id);
   } catch (err) {
     slot.log.error(err.message);
+    joinCooldown.set(channel.id, Date.now() + JOIN_COOLDOWN_MS);
+    slot.log.warn(`will not retry #${channel.name} for ${JOIN_COOLDOWN_MS / 1000}s`);
     await announce(channel, {
       title: 'Could not start recording',
       description: `**#${channel.name}** — ${err.message}`,
