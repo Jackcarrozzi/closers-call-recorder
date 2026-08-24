@@ -123,6 +123,53 @@ name in `WATCH_CATEGORY_NAMES`.
 
 ---
 
+## Capturing the screen share
+
+Discord does not give bots access to video. Not through any supported API — the
+tools that appear to do it are selfbots driving a real user account, which
+violates Discord's terms and gets the account terminated. So the screen has to
+be recorded where the pixels already exist: on the machine doing the sharing.
+
+The split ends up clean:
+
+- **The bot** knows *that* a share is happening — Discord does expose that flag —
+  and exactly when it starts and stops.
+- **The companion**, running on the sharer's PC, does the actual recording.
+
+The bot exposes a `/status` endpoint guarded by a shared secret. The companion
+polls it every few seconds and drives OBS over its built-in WebSocket. When
+someone starts sharing, OBS starts recording; when the share ends, it stops,
+renames the file to match the audio recording's name, and uploads it alongside.
+
+### Setting it up
+
+1. On the server, set `COMPANION_SECRET` to a long random string and give the
+   service a public domain (on Railway: Settings → Networking → Generate Domain).
+2. On the Windows machine that does the sharing, run `setup-windows.ps1`. It
+   installs Node, OBS and rclone, and registers the companion to start at login.
+3. In OBS: **Tools → WebSocket Server Settings → Enable**, and copy the password.
+   Add a scene with a **Display Capture** source, and make sure **Desktop Audio**
+   appears in the mixer.
+4. Fill in the three values in `C:\ClosersRecorder\companion.env`.
+
+### Keeping the files small
+
+A screen share of a mostly-static UI compresses very well, but OBS defaults are
+tuned for gameplay. In **Settings → Output → Recording**, set the encoder to
+hardware (NVENC/QuickSync/AMF) if offered, rate control **CQP** at **28**, and
+resolution **1280×720** at **30 fps** under Settings → Video. That takes a
+recording from roughly 900 MB/hour down to nearer 250 MB/hour, and a RingCentral
+window is still perfectly readable.
+
+### What this does and doesn't cover
+
+Video is captured only while that PC is on, awake, and sharing. Audio stays
+fully automatic and server-side — it records whether anyone's machine is on or
+not. That asymmetry is inherent, not a shortcut: nothing can capture a screen
+that isn't being rendered.
+
+---
+
 ## Recording two calls at once
 
 A single bot user can only hold one voice connection per server — that's a

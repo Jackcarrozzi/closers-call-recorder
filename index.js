@@ -14,6 +14,7 @@ import { RecordingSession } from './session.js';
 import { mixSession } from './mixer.js';
 import { uploadFiles, checkRemote } from './upload.js';
 import { transcribeSession } from './transcribe.js';
+import { startStatusServer } from './status-server.js';
 
 const log = logger;
 
@@ -78,6 +79,17 @@ function watchedChannels() {
 
 function humansIn(channel) {
   return channel.members.filter((m) => !(config.ignoreBots && m.user.bot)).size;
+}
+
+/**
+ * Everyone in the channel with a screen share or camera live. Discord tells us
+ * that this is happening; it does not let bots see the video itself.
+ */
+function sharersIn(channel) {
+  if (!channel) return [];
+  return [...channel.members.values()]
+    .filter((m) => !m.user.bot && (m.voice?.streaming || m.voice?.selfVideo))
+    .map((m) => ({ id: m.id, name: m.displayName, screen: !!m.voice?.streaming, camera: !!m.voice?.selfVideo }));
 }
 
 function slotRecording(channelId) {
@@ -289,6 +301,27 @@ async function finishRecording(slot, reason) {
   }
 }
 
+// ─── what the video companion asks about ──────────────────────────────────
+
+function companionState() {
+  const active = slots.find((s) => s.session);
+  if (!active) {
+    return { recording: false, shouldRecordVideo: false, sessionId: null, channel: null, sharers: [], videoMode: config.videoMode };
+  }
+  const session = active.session;
+  const sharers = sharersIn(session.channel);
+  return {
+    recording: true,
+    sessionId: session.id,
+    channel: session.channel.name,
+    startedAt: session.startedAt.toISOString(),
+    sharers,
+    videoMode: config.videoMode,
+    // The single field the companion actually acts on.
+    shouldRecordVideo: config.videoMode === 'call' ? true : sharers.length > 0,
+  };
+}
+
 // ─── notices ──────────────────────────────────────────────────────────────
 
 async function announce(sourceChannel, { title, description, color, footer }) {
@@ -350,8 +383,24 @@ async function main() {
     log.warn('recordings will be kept on disk until that is fixed');
   }
 
+  startStatusServer({
+    port: config.statusPort,
+    secret: config.companionSecret,
+    getState: companionState,
+    log,
+  });
+
   for (const slot of slots) {
-    slot.client.on('voiceStateUpdate', () => scheduleEvaluate());
+    slot.client.on('voiceStateUpdate', (before, after) => {
+      // A share starting or stopping is not a join or a leave, but the video
+      // companion is polling on it, so log it where it can be seen.
+      if (config.companionSecret && (before.streaming !== after.streaming || before.selfVideo !== after.selfVideo)) {
+        const who = after.member?.displayName ?? after.id;
+        const on = after.streaming || after.selfVideo;
+        log.info(`${who} ${on ? 'started' : 'stopped'} sharing`);
+      }
+      scheduleEvaluate();
+    });
     slot.client.on('error', (err) => slot.log.warn(`gateway error: ${err.message}`));
     slot.client.once('ready', (c) => {
       slot.log.info(`logged in as ${c.user.tag}`);

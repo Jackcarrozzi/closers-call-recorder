@@ -83,6 +83,15 @@ export const config = {
   whisperModel: str('WHISPER_MODEL', '/models/ggml-base.en.bin'),
 
   timezone: str('TZ', 'America/New_York'),
+
+  // Screen-share capture. The bot can't see video - Discord doesn't give bots
+  // access to it - but it can see that a share is happening, and tell the
+  // companion running on the sharer's own machine to record the screen.
+  companionSecret: str('COMPANION_SECRET'),
+  statusPort: num('PORT', 8080),
+  // "share" = roll video only while somebody is actually sharing a screen or camera.
+  // "call"  = roll for the whole call, share or not. Much larger files.
+  videoMode: str('VIDEO_MODE', 'share').toLowerCase(),
 };
 
 export function validate() {
@@ -96,6 +105,9 @@ export function validate() {
     problems.push(
       'Nothing to watch: set WATCH_CATEGORY_NAMES (e.g. "Closers"), WATCH_CHANNEL_NAMES, or WATCH_CHANNEL_IDS.'
     );
+  }
+  if (!['share', 'call'].includes(config.videoMode)) {
+    problems.push(`VIDEO_MODE must be share or call (got "${config.videoMode}").`);
   }
   if (!['off', 'openai', 'local'].includes(config.transcribe)) {
     problems.push(`TRANSCRIBE must be off, openai, or local (got "${config.transcribe}").`);
