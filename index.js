@@ -369,6 +369,12 @@ async function main() {
   const problems = validate();
   if (problems.length) {
     for (const p of problems) log.error(p);
+    // Exiting instantly on a container host produces a restart storm - the
+    // platform relaunches us, we fail again, and the log fills with the same
+    // two lines several times a second. Pause first so the reason stays
+    // readable and the restarts stay cheap.
+    log.error('configuration is incomplete - pausing 30s so this does not restart in a loop');
+    await new Promise((r) => setTimeout(r, 30_000));
     process.exit(1);
   }
 
