@@ -15,6 +15,7 @@ import { mixSession } from './mixer.js';
 import { uploadFiles, checkRemote } from './upload.js';
 import { transcribeSession } from './transcribe.js';
 import { startStatusServer } from './status-server.js';
+import { generateDependencyReport } from '@discordjs/voice';
 
 const log = logger;
 
@@ -506,6 +507,12 @@ async function main() {
   }
 
   await fs.mkdir(path.join(config.dataDir, 'sessions'), { recursive: true });
+
+  // If the native audio or encryption modules failed to build in this image,
+  // voice cannot work and nothing else in the log will say so.
+  for (const line of generateDependencyReport().split('\n')) {
+    if (line.trim()) log.info(`deps | ${line}`);
+  }
 
   const remote = await checkRemote({
     remote: config.rcloneRemote,

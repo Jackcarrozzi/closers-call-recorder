@@ -109,6 +109,14 @@ export class RecordingSession extends EventEmitter {
   #watchConnection() {
     const conn = this.connection;
     conn.on('stateChange', (oldS, newS) => {
+      // The path should be signalling -> connecting -> ready. Printing every hop,
+      // with the close code when there is one, is the only way to see where it
+      // actually stops.
+      let detail = '';
+      if (newS.reason !== undefined) detail += ` reason=${newS.reason}`;
+      if (newS.closeCode !== undefined) detail += ` closeCode=${newS.closeCode}`;
+      this.log.info(`voice: ${oldS.status} -> ${newS.status}${detail}`);
+
       if (newS.status === VoiceConnectionStatus.Disconnected && !this.stopping) {
         // A move or a network blip. Give it a moment to reconnect on its own
         // before giving up on the call.
