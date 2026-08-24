@@ -365,6 +365,54 @@ async function pruneOldSessions() {
 
 // ─── boot ─────────────────────────────────────────────────────────────────
 
+/** login() resolves before the gateway has sent us any guilds. Wait for the real thing. */
+function waitUntilReady(client, timeoutMs = 30_000) {
+  if (client.isReady()) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(
+      () => reject(new Error('the gateway never became ready within 30s')),
+      timeoutMs
+    );
+    client.once('ready', () => {
+      clearTimeout(timer);
+      resolve();
+    });
+  });
+}
+
+/**
+ * Nothing matched. Rather than just saying so, print the categories and voice
+ * channels the bot can actually see - a one-character difference in the
+ * category name is by far the most common cause, and this makes it obvious.
+ */
+function describeWhatWeCanSee() {
+  log.warn('nothing matched. Here is everything this bot can see:');
+  let sawAnything = false;
+  for (const slot of slots) {
+    for (const guild of slot.client.guilds.cache.values()) {
+      const voice = [...guild.channels.cache.values()].filter(
+        (ch) => ch.type === ChannelType.GuildVoice || ch.type === ChannelType.GuildStageVoice
+      );
+      log.warn(`  server "${guild.name}" (GUILD_ID=${guild.id}) - ${voice.length} voice channel(s)`);
+      for (const ch of voice) {
+        sawAnything = true;
+        const perms = ch.permissionsFor(guild.members.me);
+        const ok = perms?.has('ViewChannel') && perms?.has('Connect');
+        log.warn(
+          `    #${ch.name}  (id ${ch.id})  category: ${ch.parent?.name ?? '(none)'}` +
+            `${ok ? '' : '   <- NO ACCESS: the bot lacks View or Connect here'}`
+        );
+      }
+    }
+  }
+  if (!sawAnything) {
+    log.warn('  ...nothing at all. The bot is not in any server, or cannot see any voice channels.');
+  }
+  log.warn(`WATCH_CATEGORY_NAMES is currently: ${JSON.stringify(config.watchCategoryNames)}`);
+  log.warn('Category names must match exactly, apart from capitalisation.');
+}
+
+
 async function main() {
   const problems = validate();
   if (problems.length) {
@@ -413,6 +461,7 @@ async function main() {
     });
     try {
       await slot.client.login(slot.token);
+      await waitUntilReady(slot.client);
     } catch (err) {
       log.error(
         /token/i.test(err.message)
@@ -424,10 +473,10 @@ async function main() {
   }
 
   const channels = watchedChannels();
-  log.info(`watching ${channels.length} voice channel(s): ${channels.map((c) => '#' + c.name).join(', ') || '(none matched yet)'}`);
-  if (channels.length === 0) {
-    log.warn('nothing matched - check WATCH_CATEGORY_NAMES and that the bot can see the channels');
-  }
+  log.info(
+    `watching ${channels.length} voice channel(s): ${channels.map((c) => '#' + c.name).join(', ') || '(none)'}`
+  );
+  if (channels.length === 0) describeWhatWeCanSee();
 
   await pruneOldSessions();
   setInterval(() => pruneOldSessions().catch(() => {}), 6 * 3600 * 1000).unref?.();
