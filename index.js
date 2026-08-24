@@ -57,10 +57,17 @@ function isWatched(channel) {
   if (config.guildId && channel.guild.id !== config.guildId) return false;
 
   if (config.watchChannelIds.includes(channel.id)) return true;
-  if (config.watchChannelNames.includes(channel.name.toLowerCase())) return true;
+
+  const name = channel.name.toLowerCase();
+  if (config.watchChannelNames.includes(name)) return true;
 
   const category = channel.parent?.name?.toLowerCase();
   if (category && config.watchCategoryNames.includes(category)) return true;
+
+  // Being strict here costs more than it's worth. "Closers" is just as likely
+  // to be the name of the channel as the name of the category above it, and
+  // getting that wrong looks exactly like a broken bot. Match either.
+  if (config.watchCategoryNames.includes(name)) return true;
 
   return false;
 }
@@ -487,7 +494,9 @@ async function main() {
 
   const channels = watchedChannels();
   log.info(
-    `watching ${channels.length} voice channel(s): ${channels.map((c) => '#' + c.name).join(', ') || '(none)'}`
+    `watching ${channels.length} voice channel(s): ${
+      channels.map((c) => `#${c.name} (in "${c.parent?.name ?? 'no category'}")`).join(', ') || '(none)'
+    }`
   );
   if (channels.length === 0) describeWhatWeCanSee();
 
