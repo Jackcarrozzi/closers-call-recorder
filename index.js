@@ -213,6 +213,7 @@ async function attemptRecording(channel) {
     joinCooldown.delete(channel.id);
   } catch (err) {
     slot.log.error(err.message);
+    describeJoinFailure(slot, channel);
     joinCooldown.set(channel.id, Date.now() + JOIN_COOLDOWN_MS);
     slot.log.warn(`will not retry #${channel.name} for ${JOIN_COOLDOWN_MS / 1000}s`);
     await announce(channel, {
@@ -353,6 +354,38 @@ function companionState() {
   };
 }
 
+/**
+ * A voice connection stuck in "signalling" means Discord received our request and
+ * declined to answer. It never says why, so print the things that cause it.
+ */
+function describeJoinFailure(slot, channel) {
+  try {
+    const me = channel.guild.members.me;
+    const perms = channel.permissionsFor(me);
+    const need = ['ViewChannel', 'Connect', 'Speak', 'UseVAD'];
+    const held = need.map((p) => `${p}=${perms?.has(p) ? 'yes' : 'NO'}`).join('  ');
+    const humans = channel.members.filter((m) => !m.user.bot).size;
+
+    slot.log.warn(`  channel type: ${channel.type} (2 = voice, 13 = stage)`);
+    slot.log.warn(`  bot permissions here: ${held}`);
+    slot.log.warn(
+      `  user limit: ${channel.userLimit || 'none'}   currently in channel: ${channel.members.size} (${humans} human)`
+    );
+    if (channel.userLimit && channel.members.size >= channel.userLimit) {
+      slot.log.warn('  >> THE CHANNEL IS FULL. Raise the user limit or the bot cannot get in.');
+    }
+    if (!perms?.has('Connect')) {
+      slot.log.warn('  >> THE BOT LACKS CONNECT on this channel. Fix its role permissions.');
+    }
+    if (channel.type === 13) {
+      slot.log.warn('  >> This is a Stage channel. The bot needs to be invited to speak.');
+    }
+    slot.log.warn(`  bot is server-deafened: ${me?.voice?.serverDeaf ? 'YES - undo that' : 'no'}`);
+  } catch (err) {
+    slot.log.warn(`  (could not inspect the channel: ${err.message})`);
+  }
+}
+
 // ─── notices ──────────────────────────────────────────────────────────────
 
 async function announce(sourceChannel, { title, description, color, footer }) {
@@ -487,7 +520,11 @@ async function main() {
     slot.client.on('voiceStateUpdate', (before, after) => {
       // A share starting or stopping is not a join or a leave, but the video
       // companion is polling on it, so log it where it can be seen.
-      if (config.companionSecret && (before.streaming !== after.streaming || before.selfVideo !== after.selfVideo)) {
+      if (
+        config.companionSecret &&
+        !after.member?.user?.bot &&
+        (before.streaming !== after.streaming || before.selfVideo !== after.selfVideo)
+      ) {
         const who = after.member?.displayName ?? after.id;
         const on = after.streaming || after.selfVideo;
         log.info(`${who} ${on ? 'started' : 'stopped'} sharing`);
