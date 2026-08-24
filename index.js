@@ -48,8 +48,63 @@ const slots = config.tokens.map((token, i) => new Slot(i, token));
 const graceTimers = new Map(); // channelId -> timeout
 const joinCooldown = new Map(); // channelId -> ms timestamp; set after a failed join
 const joinInFlight = new Set(); // channelIds we are mid-join on, right now
-const JOIN_COOLDOWN_MS = 30_000;
+const JOIN_COOLDOWN_MS = 20_000;
+const JOIN_ATTEMPTS = 3;
+const IDLE_SWEEP_MS = 15_000;
 let evaluateQueued = false;
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+function channelLabel(guild, id) {
+  const ch = guild.channels.cache.get(id);
+  return ch ? `#${ch.name}` : id;
+}
+
+/**
+ * Leave voice the way a real client does, over the gateway.
+ *
+ * This is the fix for the join that dies in "signalling". A killed or
+ * redeployed container leaves Discord believing the bot is still sitting in the
+ * channel. Asking to join a channel it already has us in changes nothing, so it
+ * never replies with a voice server, and the handshake waits for an answer that
+ * is never coming. Op 4 with a null channel is the only way to clear that.
+ *
+ * It is sent unconditionally rather than only when our cache says we are stuck,
+ * because that cache being a step behind is one of the ways we got here.
+ * Unlike GuildMember#disconnect() this is not a moderation action, so it needs
+ * no Move Members permission - which the bot does not have.
+ */
+async function leaveVoice(guild, log) {
+  const held = guild.members.me?.voice?.channelId ?? null;
+  if (held) log.warn(`clearing our leftover voice session in ${channelLabel(guild, held)}`);
+
+  try {
+    guild.shard.send({
+      op: 4,
+      d: { guild_id: guild.id, channel_id: null, self_mute: false, self_deaf: false },
+    });
+  } catch (err) {
+    log.warn(`could not send the voice leave: ${err.message}`);
+    return false;
+  }
+
+  if (!held) {
+    await sleep(250); // let it reach Discord before we ask to join again
+    return false;
+  }
+
+  // Wait for Discord to confirm instead of guessing at a delay.
+  const deadline = Date.now() + 5_000;
+  while (Date.now() < deadline) {
+    await sleep(200);
+    if (!guild.members.me?.voice?.channelId) {
+      log.info('leftover voice session cleared');
+      return true;
+    }
+  }
+  log.warn('Discord did not confirm the leave within 5s - trying the join anyway');
+  return true;
+}
 
 // ─── channel matching ─────────────────────────────────────────────────────
 
@@ -201,30 +256,57 @@ async function attemptRecording(channel) {
   }
 
   const liveChannel = slot.client.channels.cache.get(channel.id) ?? channel;
-  const session = new RecordingSession({
-    channel: liveChannel,
-    dataDir: config.dataDir,
-    log: slot.log,
-    minDurationSec: config.minDurationSec,
-    maxSessionHours: config.maxSessionHours,
-  });
+  const guild = liveChannel.guild;
 
-  try {
-    await session.start();
-    joinCooldown.delete(channel.id);
-  } catch (err) {
-    slot.log.error(err.message);
+  let session = null;
+  let lastErr = null;
+
+  for (let attempt = 1; attempt <= JOIN_ATTEMPTS; attempt++) {
+    // Always drop any voice session of our own first. See leaveVoice().
+    await leaveVoice(guild, slot.log);
+
+    const candidate = new RecordingSession({
+      channel: liveChannel,
+      dataDir: config.dataDir,
+      log: slot.log,
+      minDurationSec: config.minDurationSec,
+      maxSessionHours: config.maxSessionHours,
+    });
+
+    try {
+      await candidate.start();
+      session = candidate;
+      break;
+    } catch (err) {
+      lastErr = err;
+      await candidate.discard(); // don't leave an empty session folder behind
+      if (attempt < JOIN_ATTEMPTS) {
+        slot.log.warn(`${err.message}`);
+        slot.log.warn(`clearing and trying again (attempt ${attempt + 1} of ${JOIN_ATTEMPTS})`);
+        await sleep(3_000);
+      }
+    }
+  }
+
+  if (!session) {
+    slot.log.error(lastErr.message);
     describeJoinFailure(slot, channel);
+    await leaveVoice(guild, slot.log); // leave nothing for the next try to trip over
     joinCooldown.set(channel.id, Date.now() + JOIN_COOLDOWN_MS);
     slot.log.warn(`will not retry #${channel.name} for ${JOIN_COOLDOWN_MS / 1000}s`);
+    // A cooldown nobody ever comes back to is just a stop. Re-check ourselves:
+    // waiting on the next voiceStateUpdate means a call that is already under
+    // way is never picked up, which is how one failed join became permanent.
+    setTimeout(() => scheduleEvaluate(), JOIN_COOLDOWN_MS + 500).unref?.();
     await announce(channel, {
       title: 'Could not start recording',
-      description: `**#${channel.name}** — ${err.message}`,
+      description: `**#${channel.name}** — ${lastErr.message}`,
       color: 0xcc3333,
     });
     return;
   }
 
+  joinCooldown.delete(channel.id);
   slot.session = session;
   session.once('connection-lost', () => {
     finishRecording(slot, 'connection lost').catch((err) => log.error(err.message));
@@ -386,8 +468,15 @@ function describeJoinFailure(slot, channel) {
     slot.log.warn(
       `  bot's own voice state: ${stale ? `STALE - Discord thinks it is in ${stale}` : 'clean'}`
     );
-    if (stale) {
-      slot.log.warn('  >> That ghost session is why the join hangs. It is cleared automatically on the next try.');
+    if (stale === channel.id) {
+      slot.log.warn(
+        '  >> Discord put us in the channel but never sent a voice server. The VOICE_SERVER_UPDATE'
+      );
+      slot.log.warn(
+        '     line above says which: present = the media path failed, absent = Discord never answered.'
+      );
+    } else if (stale) {
+      slot.log.warn(`  >> We are still held in ${channelLabel(channel.guild, stale)}. That blocks this join.`);
     }
   } catch (err) {
     slot.log.warn(`  (could not inspect the channel: ${err.message})`);
@@ -545,6 +634,20 @@ async function main() {
       }
       scheduleEvaluate();
     });
+    // The handshake needs VOICE_STATE_UPDATE *and* VOICE_SERVER_UPDATE back from
+    // Discord. Watching the raw packets is the only way to tell "Discord never
+    // answered" apart from "it answered and we could not use the answer".
+    slot.client.on('raw', (packet) => {
+      const d = packet?.d;
+      if (packet?.t === 'VOICE_SERVER_UPDATE') {
+        slot.log.info(`gateway: VOICE_SERVER_UPDATE endpoint=${d?.endpoint ?? 'null'}`);
+      } else if (packet?.t === 'VOICE_STATE_UPDATE' && d?.user_id === slot.client.user?.id) {
+        slot.log.info(
+          `gateway: our VOICE_STATE_UPDATE channel=${d?.channel_id ?? 'null'} ` +
+            `session=${d?.session_id ? 'yes' : 'no'}`
+        );
+      }
+    });
     slot.client.on('error', (err) => slot.log.warn(`gateway error: ${err.message}`));
     let announced = false;
     const announceLogin = () => {
@@ -578,11 +681,37 @@ async function main() {
   await pruneOldSessions();
   setInterval(() => pruneOldSessions().catch(() => {}), 6 * 3600 * 1000).unref?.();
 
+  // Whatever the last container left behind, we are not in a call now. Clear it
+  // before the first join attempt rather than discovering it 15s into a timeout.
+  for (const slot of slots) {
+    for (const guild of slot.client.guilds.cache.values()) {
+      await leaveVoice(guild, slot.log);
+    }
+  }
+
   // Catch calls that were already running when the bot started.
   scheduleEvaluate();
 
+  // Events can be missed - a dropped gateway resume, a join during a restart, a
+  // cooldown that expired while the channel sat unchanged. A cheap sweep over
+  // the cache makes every one of those self-correcting instead of permanent.
+  setInterval(() => scheduleEvaluate(), IDLE_SWEEP_MS).unref?.();
+
   const shutdown = async (signal) => {
     log.info(`${signal} received - finishing any live recording before exit`);
+    // Do this first. If the platform kills us during the mixdown, this is what
+    // stops the next container inheriting a voice session it can never join over.
+    for (const slot of slots) {
+      for (const guild of slot.client.guilds.cache.values()) {
+        try {
+          guild.shard.send({
+            op: 4,
+            d: { guild_id: guild.id, channel_id: null, self_mute: false, self_deaf: false },
+          });
+        } catch {}
+      }
+    }
+    await sleep(500);
     await Promise.all(
       slots.filter((s) => s.session).map((s) => finishRecording(s, `shutdown (${signal})`))
     );
