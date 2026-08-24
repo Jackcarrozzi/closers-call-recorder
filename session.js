@@ -34,7 +34,15 @@ export class RecordingSession extends EventEmitter {
     this.subscribed = new Set();
     this.connection = null;
     this.stopping = false;
+    this.ready = false;
     this.capTimer = null;
+  }
+
+  /** Throw away a session that never got off the ground, dir and all. */
+  async discard() {
+    this.#destroyQuietly();
+    this.connection = null;
+    await fs.rm(this.dir, { recursive: true, force: true }).catch(() => {});
   }
 
   get durationMs() {
@@ -44,23 +52,9 @@ export class RecordingSession extends EventEmitter {
   async start() {
     await fs.mkdir(this.dir, { recursive: true });
 
-    // A crash or a killed container can leave Discord believing the bot is still
-    // sitting in a voice channel. It then ignores every new connect request and
-    // the handshake dies in "signalling" with no explanation. Clear any stale
-    // voice state of our own before asking to join.
-    const me = this.guild.members.me;
-    if (me?.voice?.channelId) {
-      this.log.warn(
-        `clearing a stale voice session in #${me.voice.channel?.name ?? me.voice.channelId} first`
-      );
-      try {
-        await me.voice.disconnect();
-        await new Promise((r) => setTimeout(r, 1500));
-      } catch (err) {
-        this.log.warn(`could not clear it: ${err.message}`);
-      }
-    }
-
+    // Clearing a leftover voice session is the caller's job now - it has to
+    // happen before we get this far, and it needs the gateway rather than the
+    // REST call this used to make.
     this.connection = joinVoiceChannel({
       channelId: this.channel.id,
       guildId: this.guild.id,
@@ -69,20 +63,29 @@ export class RecordingSession extends EventEmitter {
       selfMute: true,  // the bot never speaks
     });
 
+    // Attach this BEFORE waiting, not after. The handshake is the part that
+    // fails, so a listener registered once it has succeeded can never describe
+    // it - which is exactly why the previous build logged nothing.
+    this.#watchStates();
+
     try {
-      await entersState(this.connection, VoiceConnectionStatus.Ready, 15_000);
+      await entersState(this.connection, VoiceConnectionStatus.Ready, 20_000);
     } catch (err) {
       // Report the connection's own state too. "timed out" alone doesn't say
       // whether we were refused, disconnected, or never got a UDP path at all.
       const state = this.connection?.state?.status ?? 'unknown';
+      const code = this.connection?.state?.closeCode;
       this.#destroyQuietly();
       this.connection = null;
-      throw new Error(
-        `could not join #${this.channel.name} (voice connection state: ${state}): ${err.message}`
+      const failure = new Error(
+        `could not join #${this.channel.name} (voice connection state: ${state}` +
+          `${code === undefined ? '' : `, closeCode=${code}`}): ${err.message}`
       );
+      failure.voiceState = state;
+      throw failure;
     }
 
-    this.#watchConnection();
+    this.ready = true;
     this.#watchSpeakers();
 
     if (this.maxSessionHours > 0) {
@@ -106,7 +109,7 @@ export class RecordingSession extends EventEmitter {
     } catch {}
   }
 
-  #watchConnection() {
+  #watchStates() {
     const conn = this.connection;
     conn.on('stateChange', (oldS, newS) => {
       // The path should be signalling -> connecting -> ready. Printing every hop,
@@ -117,7 +120,9 @@ export class RecordingSession extends EventEmitter {
       if (newS.closeCode !== undefined) detail += ` closeCode=${newS.closeCode}`;
       this.log.info(`voice: ${oldS.status} -> ${newS.status}${detail}`);
 
-      if (newS.status === VoiceConnectionStatus.Disconnected && !this.stopping) {
+      // Only meaningful once the call is actually up; during the initial
+      // handshake a disconnect is the failure itself, which start() reports.
+      if (this.ready && newS.status === VoiceConnectionStatus.Disconnected && !this.stopping) {
         // A move or a network blip. Give it a moment to reconnect on its own
         // before giving up on the call.
         Promise.race([
