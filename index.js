@@ -47,9 +47,17 @@ class Slot {
 const slots = config.tokens.map((token, i) => new Slot(i, token));
 const graceTimers = new Map(); // channelId -> timeout
 const joinCooldown = new Map(); // channelId -> ms timestamp; set after a failed join
+const joinRounds = new Map(); // channelId -> how many times joining has failed
+const abandoned = new Set(); // channelIds we have stopped trying, until a redeploy
 const joinInFlight = new Set(); // channelIds we are mid-join on, right now
-const JOIN_COOLDOWN_MS = 20_000;
-const JOIN_ATTEMPTS = 3;
+// A failing join is visible in Discord: the bot appears in the channel, sits
+// there, and vanishes. Retrying that forever is worse than not recording, so
+// the budget is fixed and small. Two tries per attempt, two attempts total,
+// widening pauses between them, and then the channel is abandoned for the life
+// of this process. Four appearances, worst case, and then silence.
+const JOIN_ATTEMPTS = 2;
+const MAX_JOIN_ROUNDS = 2;
+const JOIN_BACKOFF_MS = [60_000, 300_000];
 const IDLE_SWEEP_MS = 15_000;
 let evaluateQueued = false;
 
@@ -180,6 +188,7 @@ function scheduleEvaluate() {
 
 async function evaluate() {
   for (const channel of watchedChannels()) {
+    if (abandoned.has(channel.id)) continue;
     const people = humansIn(channel);
     const active = slotRecording(channel.id);
 
@@ -291,21 +300,37 @@ async function attemptRecording(channel) {
   if (!session) {
     slot.log.error(lastErr.message);
     describeJoinFailure(slot, channel);
-    await leaveVoice(guild, slot.log); // leave nothing for the next try to trip over
-    joinCooldown.set(channel.id, Date.now() + JOIN_COOLDOWN_MS);
-    slot.log.warn(`will not retry #${channel.name} for ${JOIN_COOLDOWN_MS / 1000}s`);
-    // A cooldown nobody ever comes back to is just a stop. Re-check ourselves:
-    // waiting on the next voiceStateUpdate means a call that is already under
-    // way is never picked up, which is how one failed join became permanent.
-    setTimeout(() => scheduleEvaluate(), JOIN_COOLDOWN_MS + 500).unref?.();
-    await announce(channel, {
-      title: 'Could not start recording',
-      description: `**#${channel.name}** — ${lastErr.message}`,
-      color: 0xcc3333,
-    });
+    await leaveVoice(guild, slot.log); // leave nothing behind in the channel
+
+    const round = (joinRounds.get(channel.id) ?? 0) + 1;
+    joinRounds.set(channel.id, round);
+
+    if (round >= MAX_JOIN_ROUNDS) {
+      abandoned.add(channel.id);
+      slot.log.error(
+        `giving up on #${channel.name}. It will not be tried again until this service is ` +
+          `redeployed - repeatedly appearing and vanishing in the channel is worse than not recording.`
+      );
+      await announce(channel, {
+        title: 'Recording disabled for this channel',
+        description:
+          `**#${channel.name}** — could not be joined: ${lastErr.message}\n` +
+          `No further attempts will be made until the recorder is restarted.`,
+        color: 0xcc3333,
+      });
+      return;
+    }
+
+    const wait = JOIN_BACKOFF_MS[Math.min(round - 1, JOIN_BACKOFF_MS.length - 1)];
+    joinCooldown.set(channel.id, Date.now() + wait);
+    slot.log.warn(
+      `will try #${channel.name} once more in ${Math.round(wait / 1000)}s, then stop trying`
+    );
+    setTimeout(() => scheduleEvaluate(), wait + 500).unref?.();
     return;
   }
 
+  joinRounds.delete(channel.id);
   joinCooldown.delete(channel.id);
   slot.session = session;
   session.once('connection-lost', () => {
@@ -644,7 +669,7 @@ async function main() {
       } else if (packet?.t === 'VOICE_STATE_UPDATE' && d?.user_id === slot.client.user?.id) {
         slot.log.info(
           `gateway: our VOICE_STATE_UPDATE channel=${d?.channel_id ?? 'null'} ` +
-            `session=${d?.session_id ? 'yes' : 'no'}`
+            `session=${d?.session_id ? String(d.session_id).slice(-8) : 'none'}`
         );
       }
     });
