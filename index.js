@@ -12,9 +12,11 @@ import { config, validate } from './config.js';
 import { logger } from './logger.js';
 import { RecordingSession } from './session.js';
 import { mixSession } from './mixer.js';
-import { uploadFiles, checkRemote } from './upload.js';
+import { uploadFiles, checkRemote, reserveUploads } from './upload.js';
 import { transcribeSession } from './transcribe.js';
 import { startStatusServer } from './status-server.js';
+import { recoverOrphanedSessions } from './recover.js';
+import { sweepBacklog } from './backlog.js';
 import { generateDependencyReport } from '@discordjs/voice';
 
 const log = logger;
@@ -73,7 +75,10 @@ const DISK_STOP_BYTES = 250_000_000; // refuse to start anything new
 let diskPaused = false;
 let lastDiskWarn = 0;
 let lastPauseWarn = 0;
+let lastUploadFailWarn = 0;
 let evaluateQueued = false;
+
+const BACKLOG_SWEEP_MS = 15 * 60 * 1000;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -537,24 +542,36 @@ async function finishRecording(slot, reason) {
       channels: config.audioChannels,
     });
 
-    let transcript = null;
-    if (config.transcribe !== 'off') {
-      try {
-        transcript = await transcribeSession({
-          mode: config.transcribe,
-          tracks,
-          manifest,
-          outFile: path.join(dir, `${session.id}.txt`),
-          config,
-          log: slot.log,
-        });
-      } catch (err) {
-        slot.log.warn(`transcription failed: ${err.message}`);
-      }
-    }
+    // These are finished and complete, but nothing will upload them until the
+    // end of this block. Hold them so the backlog sweep, which by then may
+    // well consider them old enough to have been abandoned, leaves them to us
+    // rather than uploading and deleting them mid-transcription.
+    const releaseHold = reserveUploads([main, ...perSpeaker.map((p) => p.file)]);
 
-    // The raw per-speaker PCM has served its purpose.
-    for (const t of tracks) await fs.rm(t.file, { force: true });
+    let transcript = null;
+    try {
+      if (config.transcribe !== 'off') {
+        try {
+          transcript = await transcribeSession({
+            mode: config.transcribe,
+            tracks,
+            manifest,
+            outFile: path.join(dir, `${session.id}.txt`),
+            config,
+            log: slot.log,
+          });
+        } catch (err) {
+          slot.log.warn(`transcription failed: ${err.message}`);
+        }
+      }
+
+      // The raw per-speaker PCM has served its purpose.
+      for (const t of tracks) await fs.rm(t.file, { force: true });
+    } finally {
+      // Handed straight over to our own uploadFiles() below, which does its
+      // own claiming - holding past this point would make it skip them.
+      releaseHold();
+    }
 
     const files = [main, ...perSpeaker.map((p) => p.file), transcript].filter(Boolean);
     let uploaded = { uploaded: [], skipped: true };
@@ -569,6 +586,23 @@ async function finishRecording(slot, reason) {
       });
     } catch (err) {
       slot.log.error(`upload failed, keeping local copy: ${err.message}`);
+      // This is the disk-fill mechanism: if uploads keep failing (a dead
+      // token, a network outage) recordings just pile up locally with
+      // nothing but this log line to say why. Announce it too, but no more
+      // than once per 6h - a bad token fails every chunk, and nobody needs
+      // that in the notices channel every couple of hours.
+      if (Date.now() - lastUploadFailWarn > 6 * 3600_000) {
+        lastUploadFailWarn = Date.now();
+        await announce(session.channel, {
+          title: 'Uploads to Google Drive are failing',
+          description:
+            `**#${session.channel.name}** could not be uploaded: ${err.message}\n` +
+            `Nothing is lost - recordings stay on the server - but this will fill the disk if it ` +
+            `keeps happening. Check the rclone / Google Drive setup. It will retry automatically ` +
+            `once that's fixed.`,
+          color: 0xcc3333,
+        }).catch(() => {});
+      }
     }
 
     if (config.deleteLocalAfterUpload && uploaded.uploaded.length >= files.length) {
@@ -778,6 +812,20 @@ async function main() {
 
   await fs.mkdir(path.join(config.dataDir, 'sessions'), { recursive: true });
 
+  // Salvage anything a crash or a hard kill left half-finished, before logging
+  // in - nothing can start a new recording until login happens below, so
+  // there is no live session for this to collide with.
+  await recoverOrphanedSessions({
+    dataDir: config.dataDir,
+    log: log.child('recover'),
+    rcloneRemote: config.rcloneRemote,
+    rcloneConfig: config.rcloneConfig,
+    uploadRetries: config.uploadRetries,
+    deleteLocalAfterUpload: config.deleteLocalAfterUpload,
+    bitrate: config.audioBitrate,
+    channels: config.audioChannels,
+  }).catch((err) => log.error(`recovery failed: ${err.stack ?? err.message}`));
+
   // If the native audio or encryption modules failed to build in this image,
   // voice cannot work and nothing else in the log will say so.
   for (const line of generateDependencyReport().split('\n')) {
@@ -792,6 +840,24 @@ async function main() {
     log.warn(`rclone remote is not reachable yet: ${remote.note}`);
     log.warn('recordings will be kept on disk until that is fixed');
   }
+
+  const backlogLog = log.child('backlog');
+  const runBacklogSweep = () =>
+    sweepBacklog({
+      dataDir: config.dataDir,
+      log: backlogLog,
+      rcloneRemote: config.rcloneRemote,
+      rcloneConfig: config.rcloneConfig,
+      uploadRetries: config.uploadRetries,
+      deleteLocalAfterUpload: config.deleteLocalAfterUpload,
+    }).catch((err) => backlogLog.warn(`sweep failed: ${err.message}`));
+
+  // Once at boot - only worth trying if the remote actually answered above -
+  // and then on a timer regardless, so a token fixed an hour from now (or a
+  // network blip that clears itself) drains the backlog on its own instead
+  // of needing a restart.
+  if (remote.ok) await runBacklogSweep();
+  setInterval(runBacklogSweep, BACKLOG_SWEEP_MS).unref?.();
 
   startStatusServer({
     port: config.statusPort,
@@ -847,6 +913,11 @@ async function main() {
           ? `Discord rejected the bot token for slot ${slot.index + 1}. Regenerate it in the developer portal.`
           : `login failed for slot ${slot.index + 1}: ${err.message}`
       );
+      // Same reasoning as the config-validation exit above: a bad or revoked
+      // token doesn't fix itself on the next restart, so pause first rather
+      // than hand Railway a crash loop to spend its restart budget on.
+      log.error('pausing 30s before exiting so this does not restart in a loop');
+      await new Promise((r) => setTimeout(r, 30_000));
       process.exit(1);
     }
   }
@@ -906,7 +977,19 @@ async function main() {
   };
   process.on('SIGINT', () => shutdown('SIGINT'));
   process.on('SIGTERM', () => shutdown('SIGTERM'));
+  // A rejected promise with nothing to catch it is left running - logging and
+  // continuing is deliberate here, so one bad await somewhere doesn't take a
+  // live recording down with it.
   process.on('unhandledRejection', (err) => log.error(`unhandled: ${err?.stack ?? err}`));
+  // A *synchronous* throw with nothing to catch it means Node is about to exit
+  // on its own anyway, in an unknown state - the safest thing this can do is
+  // log clearly and exit deliberately rather than let something already
+  // half-broken keep running. Only a short pause, not the 30s used above:
+  // this is meant to be rare, not a persistent misconfiguration.
+  process.on('uncaughtException', (err) => {
+    log.error(`uncaught exception - exiting: ${err?.stack ?? err}`);
+    setTimeout(() => process.exit(1), 5_000).unref?.();
+  });
 }
 
 main().catch((err) => {

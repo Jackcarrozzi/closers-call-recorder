@@ -16,6 +16,13 @@ import { PCM } from './config.js';
 import { SpeakerTrack } from './tracks.js';
 import { safeLabel } from './mixer.js';
 
+// How often the burst index is checkpointed to disk while a call is live. It
+// is the only copy of "which bytes of speaker-*.pcm go where on the
+// timeline" that survives a crash - session.json only gets written once, at
+// a clean stop() - so a hard kill between checkpoints can only ever cost
+// this many seconds of index, never the whole chunk. See recover.js.
+const CHECKPOINT_MS = 30_000;
+
 export class RecordingSession extends EventEmitter {
   constructor({ channel, dataDir, log, minDurationSec, maxSessionHours }) {
     super();
@@ -37,6 +44,9 @@ export class RecordingSession extends EventEmitter {
     this.ready = false;
     this.net = null;
     this.capTimer = null;
+    this.checkpointTimer = null;
+    this.checkpointFile = path.join(this.dir, 'checkpoint.json');
+    this.checkpointing = false;
   }
 
   /**
@@ -57,6 +67,7 @@ export class RecordingSession extends EventEmitter {
 
   /** Throw away a session that never got off the ground, dir and all. */
   async discard() {
+    if (this.checkpointTimer) clearInterval(this.checkpointTimer);
     this.#destroyQuietly();
     this.connection = null;
     await fs.rm(this.dir, { recursive: true, force: true }).catch(() => {});
@@ -113,8 +124,54 @@ export class RecordingSession extends EventEmitter {
       this.capTimer.unref?.();
     }
 
+    this.checkpointTimer = setInterval(() => this.#checkpoint(), CHECKPOINT_MS);
+    this.checkpointTimer.unref?.();
+
     this.log.info(`recording #${this.channel.name} -> ${this.id}`);
     return this;
+  }
+
+  /**
+   * Write the current burst index to disk so a crash loses at most this much
+   * of it. Runs on its own timer, off to the side of the audio path: it never
+   * touches track.write(), and any failure here is logged and swallowed
+   * rather than allowed to interrupt a live recording.
+   */
+  async #checkpoint() {
+    if (this.stopping || this.checkpointing) return;
+    this.checkpointing = true;
+    try {
+      const speakers = [...this.tracks.values()]
+        .filter((t) => t.totalBytes > 0)
+        .map((t) => t.toJSON());
+      if (speakers.length === 0) return; // nobody has said anything yet
+
+      const checkpoint = {
+        id: this.id,
+        guild: { id: this.guild.id, name: this.guild.name },
+        channel: { id: this.channel.id, name: this.channel.name },
+        startedAt: this.startedAt.toISOString(),
+        checkpointedAt: new Date().toISOString(),
+        durationMs: Math.round(this.durationMs),
+        speakers,
+      };
+
+      // Temp file + rename: a reader (recover.js, or us on the next tick)
+      // never sees a half-written checkpoint, and a crash mid-write leaves
+      // last checkpoint intact rather than a corrupt one.
+      //
+      // Not pretty-printed, unlike session.json. The burst index of a long
+      // call runs to tens of thousands of entries and this rewrites all of it
+      // every 30 seconds; indenting costs about a gigabyte of extra writes to
+      // the volume over a six-hour call, for a file only recover.js reads.
+      const tmp = `${this.checkpointFile}.tmp`;
+      await fs.writeFile(tmp, JSON.stringify(checkpoint));
+      await fs.rename(tmp, this.checkpointFile);
+    } catch (err) {
+      this.log.warn(`checkpoint failed (recording continues): ${err.message}`);
+    } finally {
+      this.checkpointing = false;
+    }
   }
 
   /** destroy() throws if the connection already tore itself down. That is not an error. */
@@ -239,6 +296,7 @@ export class RecordingSession extends EventEmitter {
     this.stopping = true;
     this.stoppedAt = new Date();
     if (this.capTimer) clearTimeout(this.capTimer);
+    if (this.checkpointTimer) clearInterval(this.checkpointTimer);
 
     for (const track of this.tracks.values()) {
       try {
@@ -272,6 +330,9 @@ export class RecordingSession extends EventEmitter {
       path.join(this.dir, 'session.json'),
       JSON.stringify(manifest, null, 2)
     );
+    // session.json is now the authoritative index; the checkpoint that led
+    // up to it would only cause recover.js to double-guess a clean chunk.
+    await fs.rm(this.checkpointFile, { force: true }).catch(() => {});
 
     return { manifest, tracks: withAudio, dir: this.dir, durationMs };
   }

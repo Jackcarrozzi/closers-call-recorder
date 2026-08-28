@@ -105,6 +105,13 @@ export async function mixSession({
     fifos.push(p);
   }
 
+  // ffmpeg opens (and truncates) its output the moment it starts, long before
+  // any audio has actually been encoded into it. Writing to "<name>.part" and
+  // renaming only once ffmpeg has closed the file cleanly is what lets
+  // anything else walking the sessions dir - the backlog sweep, a future
+  // boot's recovery pass - trust that a bare "*.mp3" it finds is complete.
+  const outPart = `${outFile}.part`;
+
   const args = ['-hide_banner', '-loglevel', 'error', '-y'];
   for (const f of fifos) {
     args.push('-f', 's16le', '-ar', String(PCM.sampleRate), '-ac', String(PCM.channels), '-i', f);
@@ -117,15 +124,21 @@ export async function mixSession({
       ? `[0:a]alimiter=limit=0.95[mixed]`
       : `${fifos.map((_, i) => `[${i}:a]`).join('')}amix=inputs=${tracks.length}:duration=longest:dropout_transition=0:normalize=0[sum];[sum]alimiter=limit=0.95[mixed]`;
   args.push('-filter_complex', mix);
-  args.push('-map', '[mixed]', '-ac', String(channels), '-c:a', 'libmp3lame', '-b:a', bitrate, outFile);
+  // ffmpeg otherwise guesses the output container from the filename's
+  // extension - ".part" isn't one it knows, so the format has to be named
+  // explicitly for both outputs below.
+  args.push('-map', '[mixed]', '-ac', String(channels), '-c:a', 'libmp3lame', '-b:a', bitrate, '-f', 'mp3', outPart);
 
   const perSpeaker = [];
+  const perSpeakerParts = [];
   if (keepUserTracks) {
     const base = outFile.replace(/\.mp3$/i, '');
     tracks.forEach((t, i) => {
       const file = `${base}.${safeLabel(t.label)}.mp3`;
-      args.push('-map', `${i}:a`, '-ac', '1', '-c:a', 'libmp3lame', '-b:a', bitrate, file);
+      const part = `${file}.part`;
+      args.push('-map', `${i}:a`, '-ac', '1', '-c:a', 'libmp3lame', '-b:a', bitrate, '-f', 'mp3', part);
       perSpeaker.push({ userId: t.userId, label: t.label, file });
+      perSpeakerParts.push(part);
     });
   }
 
@@ -145,8 +158,18 @@ export async function mixSession({
 
   try {
     await Promise.all([done, ...feeds]);
+    // Only now does ffmpeg's own exit code say the file is actually
+    // complete - rename it into the name everything else looks for.
+    await fsp.rename(outPart, outFile);
+    for (let i = 0; i < perSpeaker.length; i++) await fsp.rename(perSpeakerParts[i], perSpeaker[i].file);
   } finally {
     await fsp.rm(fifoDir, { recursive: true, force: true });
+    // A failed mix (or one interrupted mid-encode) leaves ".part" files
+    // instead of the renames above ever running - clean those up here so
+    // they don't sit around forever; a successful run has already renamed
+    // them away, so these are no-ops on the happy path.
+    await fsp.rm(outPart, { force: true }).catch(() => {});
+    for (const p of perSpeakerParts) await fsp.rm(p, { force: true }).catch(() => {});
   }
 
   return { main: outFile, perSpeaker };
