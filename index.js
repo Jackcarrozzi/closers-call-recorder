@@ -524,7 +524,7 @@ async function finishRecording(slot, reason) {
     }
 
     const { manifest, tracks, dir, durationMs } = result;
-    const outFile = path.join(dir, `${session.id}.mp3`);
+    const outFile = path.join(dir, `${session.fileStem()}.mp3`);
 
     slot.log.info(`mixing ${tracks.length} speaker track(s)`);
     const { main, perSpeaker } = await mixSession({
