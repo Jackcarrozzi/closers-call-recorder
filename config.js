@@ -68,6 +68,9 @@ export const config = {
   audioChannels: num('AUDIO_CHANNELS', 1), // 1 = mono mixdown, 2 = stereo
   keepUserTracks: bool('KEEP_USER_TRACKS', false),
   deleteLocalAfterUpload: bool('DELETE_LOCAL_AFTER_UPLOAD', false),
+  // Off by default, and deliberately so: throwing away a call nobody has
+  // collected yet is not a trade the recorder gets to make on its own.
+  pruneWhenFull: bool('PRUNE_WHEN_FULL', false),
   retentionDays: num('RETENTION_DAYS', 0),
 
   // Upload.
