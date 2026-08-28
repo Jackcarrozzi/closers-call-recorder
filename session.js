@@ -39,6 +39,22 @@ export class RecordingSession extends EventEmitter {
     this.capTimer = null;
   }
 
+  /**
+   * Name for the finished file: date, the span it covers, and the channel -
+   * 2026-08-28_1603-1805_CLOSERS.mp3. A ten-hour day arrives as a handful of
+   * these, and you can see at a glance which one holds the moment you want
+   * without opening any of them.
+   */
+  fileStem() {
+    const pad = (n) => String(n).padStart(2, '0');
+    const s = this.startedAt;
+    const e = this.stoppedAt ?? new Date();
+    const date = `${s.getFullYear()}-${pad(s.getMonth() + 1)}-${pad(s.getDate())}`;
+    const from = `${pad(s.getHours())}${pad(s.getMinutes())}`;
+    const to = `${pad(e.getHours())}${pad(e.getMinutes())}`;
+    return `${date}_${from}-${to}_${safeLabel(this.channel.name)}`;
+  }
+
   /** Throw away a session that never got off the ground, dir and all. */
   async discard() {
     this.#destroyQuietly();
