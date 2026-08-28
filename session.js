@@ -35,6 +35,7 @@ export class RecordingSession extends EventEmitter {
     this.connection = null;
     this.stopping = false;
     this.ready = false;
+    this.net = null;
     this.capTimer = null;
   }
 
@@ -112,6 +113,16 @@ export class RecordingSession extends EventEmitter {
   #watchStates() {
     const conn = this.connection;
     conn.on('stateChange', (oldS, newS) => {
+      // The connection only reports "connecting"; the networking instance under
+      // it is what knows whether we are opening the socket, identifying, doing
+      // the UDP handshake, or being hung up on. That distinction is the whole
+      // diagnosis, so follow each networking instance as it appears.
+      const net = newS.networking;
+      if (net && net !== this.net) {
+        this.net = net;
+        this.#watchNetworking(net);
+      }
+
       // The path should be signalling -> connecting -> ready. Printing every hop,
       // with the close code when there is one, is the only way to see where it
       // actually stops.
@@ -135,6 +146,30 @@ export class RecordingSession extends EventEmitter {
       }
     });
     conn.on('error', (err) => this.log.warn(`voice error: ${err.message}`));
+  }
+
+  /** Names for @discordjs/voice's internal networking states. */
+  #watchNetworking(net) {
+    const NAMES = [
+      'opening socket',
+      'identifying',
+      'udp handshake',
+      'selecting protocol',
+      'ready',
+      'resuming',
+      'closed',
+    ];
+    const name = (code) => NAMES[code] ?? `state ${code}`;
+
+    net.on('stateChange', (o, n) => {
+      if (o.code !== n.code) this.log.info(`voice net: ${name(o.code)} -> ${name(n.code)}`);
+    });
+    // This close code is the single number that names the cause. 4004 means our
+    // credentials were refused, 4006 that the gateway session behind them is no
+    // longer the live one - which is what a second copy of this bot running on
+    // the same token does to us.
+    net.on('close', (code) => this.log.warn(`voice socket closed: code=${code}`));
+    net.on('error', (err) => this.log.warn(`voice net error: ${err?.message ?? err}`));
   }
 
   #watchSpeakers() {
