@@ -356,8 +356,24 @@ async function finishRecording(slot, reason) {
   slot.session = null;
   slot.finalising = true;
 
+  let result;
   try {
-    const result = await session.stop(reason);
+    result = await session.stop(reason);
+  } catch (err) {
+    slot.log.error(`failed to close ${session.id}: ${err.stack ?? err.message}`);
+    slot.finalising = false;
+    scheduleEvaluate();
+    return;
+  }
+
+  // The bot is out of the channel the moment stop() returns, but mixing hours of
+  // audio takes minutes. Holding the slot across that turns every length-cap
+  // split into a gap in the call, and tells the channel every recorder is busy.
+  // Hand the slot back now; the mixdown finishes on its own time.
+  slot.finalising = false;
+  scheduleEvaluate();
+
+  try {
     if (session.isDiscardable(result)) {
       slot.log.info(`discarding ${session.id} (too short or no audio)`);
       await fs.rm(session.dir, { recursive: true, force: true });
@@ -435,9 +451,6 @@ async function finishRecording(slot, reason) {
       description: `**#${session.channel.name}** — ${err.message}\nThe raw audio is still on the server.`,
       color: 0xcc3333,
     }).catch(() => {});
-  } finally {
-    slot.finalising = false;
-    scheduleEvaluate();
   }
 }
 
