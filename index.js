@@ -59,6 +59,18 @@ const JOIN_ATTEMPTS = 2;
 const MAX_JOIN_ROUNDS = 2;
 const JOIN_BACKOFF_MS = [60_000, 300_000];
 const IDLE_SWEEP_MS = 15_000;
+
+// Running out of disk mid-call is the one failure that loses audio outright, so
+// it is guarded by measurement rather than by arithmetic about how much people
+// talk. Speech is stored uncompressed while a call is live - roughly 100 MB per
+// hour per person actually speaking - and only shrinks to an mp3 at the end.
+// Three thresholds, each one cheaper than the one below it:
+const DISK_CHECK_MS = 30_000;
+const DISK_CUT_BYTES = 1_500_000_000; // cut the chunk early and compress it now
+const DISK_PRUNE_BYTES = 800_000_000; // start deleting the oldest finished calls
+const DISK_STOP_BYTES = 250_000_000; // refuse to start anything new
+let diskPaused = false;
+let lastDiskWarn = 0;
 let evaluateQueued = false;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -175,6 +187,100 @@ function freeSlotFor(guildId) {
   return slots.find((s) => !s.busy && s.client.guilds.cache.has(guildId)) ?? null;
 }
 
+// ─── keeping the disk from ever filling ───────────────────────────────────
+
+async function freeBytes() {
+  try {
+    const st = await fs.statfs(config.dataDir);
+    return st.bavail * st.bsize;
+  } catch {
+    return Number.POSITIVE_INFINITY; // never let a failed check stop a recording
+  }
+}
+
+function human(bytes) {
+  if (!Number.isFinite(bytes)) return 'unknown';
+  const gb = bytes / 1e9;
+  return gb >= 1 ? `${gb.toFixed(1)} GB` : `${Math.round(bytes / 1e6)} MB`;
+}
+
+/** Finished sessions, oldest first. A live session's own directory is never touched. */
+async function finishedSessionDirs() {
+  const root = path.join(config.dataDir, 'sessions');
+  const live = new Set(slots.filter((s) => s.session).map((s) => s.session.dir));
+  let entries = [];
+  try {
+    entries = await fs.readdir(root, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+  const dirs = [];
+  for (const e of entries) {
+    if (!e.isDirectory()) continue;
+    const dir = path.join(root, e.name);
+    if (live.has(dir)) continue;
+    const stat = await fs.stat(dir).catch(() => null);
+    if (stat) dirs.push({ dir, name: e.name, mtimeMs: stat.mtimeMs });
+  }
+  return dirs.sort((a, b) => a.mtimeMs - b.mtimeMs);
+}
+
+async function checkDisk() {
+  const free = await freeBytes();
+  if (!Number.isFinite(free)) return;
+
+  // 1. Cheapest lever, and it loses nothing: end the chunk now. The speech on
+  //    disk is uncompressed, so finishing it turns gigabytes into megabytes and
+  //    the call carries straight on in a new chunk.
+  if (free < DISK_CUT_BYTES) {
+    // Only cut a chunk with something in it. Without this, a disk that stays
+    // full would end the call every 30 seconds and shred it into slivers, each
+    // one short enough to be thrown away as too brief to keep.
+    const active = slots.filter((s) => s.session && s.session.durationMs > 120_000);
+    if (active.length) {
+      log.warn(`only ${human(free)} free - closing the current chunk early to reclaim space`);
+      for (const slot of active) {
+        finishRecording(slot, 'low disk space').catch((err) => log.error(err.message));
+      }
+    }
+  }
+
+  // 2. Still tight: give up the oldest finished calls, oldest first.
+  if (free < DISK_PRUNE_BYTES) {
+    const dirs = await finishedSessionDirs();
+    let reclaimedFrom = [];
+    for (const d of dirs) {
+      if ((await freeBytes()) >= DISK_PRUNE_BYTES) break;
+      await fs.rm(d.dir, { recursive: true, force: true }).catch(() => {});
+      reclaimedFrom.push(d.name);
+    }
+    if (reclaimedFrom.length) {
+      log.warn(`deleted ${reclaimedFrom.length} old recording(s) to free space: ${reclaimedFrom.join(', ')}`);
+      if (Date.now() - lastDiskWarn > 3600_000) {
+        lastDiskWarn = Date.now();
+        await announce(null, {
+          title: 'Deleted old recordings to make room',
+          description:
+            `The recorder was down to ${human(free)} of disk, so it removed the ` +
+            `${reclaimedFrom.length} oldest recording(s). Set up the Drive upload and finished ` +
+            `calls will clear themselves off the server instead.`,
+          color: 0xd9822b,
+        }).catch(() => {});
+      }
+    }
+  }
+
+  // 3. Last resort: stop starting new calls rather than record a broken one.
+  const now = await freeBytes();
+  const shouldPause = now < DISK_STOP_BYTES;
+  if (shouldPause && !diskPaused) {
+    log.error(`only ${human(now)} free - not starting new recordings until there is room`);
+  } else if (!shouldPause && diskPaused) {
+    log.info(`disk recovered (${human(now)} free) - recording again`);
+  }
+  diskPaused = shouldPause;
+}
+
 // ─── the loop ─────────────────────────────────────────────────────────────
 
 function scheduleEvaluate() {
@@ -190,6 +296,7 @@ async function evaluate() {
   for (const channel of watchedChannels()) {
     if (abandoned.has(channel.id)) continue;
     const people = humansIn(channel);
+    if (diskPaused && !slotRecording(channel.id)) continue;
     const active = slotRecording(channel.id);
 
     if (people >= config.minHumans && !active) {
@@ -718,6 +825,11 @@ async function main() {
 
   await pruneOldSessions();
   setInterval(() => pruneOldSessions().catch(() => {}), 6 * 3600 * 1000).unref?.();
+
+  const startFree = await freeBytes();
+  log.info(`${human(startFree)} free on ${config.dataDir}`);
+  await checkDisk();
+  setInterval(() => checkDisk().catch((err) => log.warn(`disk check failed: ${err.message}`)), DISK_CHECK_MS).unref?.();
 
   // Whatever the last container left behind, we are not in a call now. Clear it
   // before the first join attempt rather than discovering it 15s into a timeout.
