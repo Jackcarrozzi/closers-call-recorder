@@ -66,11 +66,13 @@ const IDLE_SWEEP_MS = 15_000;
 // hour per person actually speaking - and only shrinks to an mp3 at the end.
 // Three thresholds, each one cheaper than the one below it:
 const DISK_CHECK_MS = 30_000;
+const DISK_WARN_BYTES = 2_500_000_000; // start saying so, early and clearly
 const DISK_CUT_BYTES = 1_500_000_000; // cut the chunk early and compress it now
-const DISK_PRUNE_BYTES = 800_000_000; // start deleting the oldest finished calls
+const DISK_PRUNE_BYTES = 800_000_000; // only with PRUNE_WHEN_FULL - off by default
 const DISK_STOP_BYTES = 250_000_000; // refuse to start anything new
 let diskPaused = false;
 let lastDiskWarn = 0;
+let lastPauseWarn = 0;
 let evaluateQueued = false;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -245,8 +247,25 @@ async function checkDisk() {
     }
   }
 
-  // 2. Still tight: give up the oldest finished calls, oldest first.
-  if (free < DISK_PRUNE_BYTES) {
+  // 2. Getting tight. Say so, early and repeatedly, and delete nothing. A
+  //    recording nobody has collected yet is not something to trade away for
+  //    room; that decision belongs to whoever owns the calls.
+  if (free < DISK_WARN_BYTES && Date.now() - lastDiskWarn > 6 * 3600_000) {
+    lastDiskWarn = Date.now();
+    const days = Math.max(0, Math.floor((free - DISK_STOP_BYTES) / 300_000_000));
+    log.warn(`disk down to ${human(free)} free - roughly ${days} more day(s) of recording`);
+    await announce(null, {
+      title: 'Recorder is running low on space',
+      description:
+        `${human(free)} left on the server, roughly **${days} more day(s)** of recording at ` +
+        `ten hours a day.\nNothing has been deleted and nothing will be. Finish the Google Drive ` +
+        `setup and finished calls will clear themselves off the server automatically.`,
+      color: 0xd9822b,
+    }).catch(() => {});
+  }
+
+  // 3. Deleting the oldest calls, only if someone deliberately turned it on.
+  if (free < DISK_PRUNE_BYTES && config.pruneWhenFull) {
     const dirs = await finishedSessionDirs();
     let reclaimedFrom = [];
     for (const d of dirs) {
@@ -270,13 +289,30 @@ async function checkDisk() {
     }
   }
 
-  // 3. Last resort: stop starting new calls rather than record a broken one.
+  // 4. Full. Stop starting new calls rather than delete old ones or write a
+  //    broken file. This is the deliberate end of the line, and it is loud.
   const now = await freeBytes();
   const shouldPause = now < DISK_STOP_BYTES;
   if (shouldPause && !diskPaused) {
     log.error(`only ${human(now)} free - not starting new recordings until there is room`);
   } else if (!shouldPause && diskPaused) {
     log.info(`disk recovered (${human(now)} free) - recording again`);
+    await announce(null, {
+      title: 'Recording again',
+      description: `There is ${human(now)} of room on the server, so recording has resumed.`,
+      color: 0x2f6b4f,
+    }).catch(() => {});
+  }
+  if (shouldPause && Date.now() - lastPauseWarn > 3600_000) {
+    lastPauseWarn = Date.now();
+    await announce(null, {
+      title: 'RECORDING STOPPED - the server is full',
+      description:
+        `Only ${human(now)} left, and nothing is being deleted, so new calls are **not** being ` +
+        `recorded. Every recording made so far is safe on the server.\nFinish the Google Drive ` +
+        `setup, or pull the files off, and recording restarts on its own within a minute.`,
+      color: 0xcc3333,
+    }).catch(() => {});
   }
   diskPaused = shouldPause;
 }
