@@ -29,6 +29,17 @@ import { mixSession } from './mixer.js';
 import { uploadFiles } from './upload.js';
 import { removeIfSpent } from './backlog.js';
 
+// mixSession() cleans up its own "<name>.mp3.part" on a normal failure, but
+// that cleanup runs in a finally block, which a SIGKILL mid-mix never
+// reaches - the ".part" is then left behind forever, and since it isn't one
+// of removeIfSpent()'s recognised index files, it blocks that directory from
+// ever being removed even after everything else in it is gone. A ".part" is
+// by definition an incomplete mix - nothing anywhere ever reads one - so it
+// is always safe to delete. The age gate exists only so this rule stays safe
+// if this function is ever run somewhere a mix could genuinely be live; at
+// boot, before login, nothing is.
+const STALE_PART_MS = 60 * 60 * 1000;
+
 /** The most complete index available for a directory: the real one if the
  *  chunk reached stop(), the last checkpoint otherwise. */
 async function loadIndex(dir) {
@@ -88,6 +99,17 @@ export async function recoverOrphanedSessions({
     } catch {
       continue;
     }
+
+    for (const f of files) {
+      if (!f.isFile() || !/\.mp3\.part$/i.test(f.name)) continue;
+      const full = path.join(dir, f.name);
+      const stat = await fs.stat(full).catch(() => null);
+      if (stat && Date.now() - stat.mtimeMs > STALE_PART_MS) {
+        await fs.rm(full, { force: true }).catch(() => {});
+        log.warn(`${entry.name}: removed stale ${f.name} left by an interrupted mix`);
+      }
+    }
+
     const pcmFiles = files.filter((f) => f.isFile() && /^speaker-.+\.pcm$/.test(f.name));
     if (pcmFiles.length === 0) continue; // a clean stop() always removes these
 

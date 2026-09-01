@@ -37,26 +37,45 @@ const UPLOADABLE = /\.(mp3|txt)$/i;
 // spent and can be removed.
 const INDEX_FILES = new Set(['session.json', 'checkpoint.json', 'checkpoint.json.tmp']);
 
+// A SIGKILL mid-mix can leave "<name>.mp3.part" behind - mixSession()'s own
+// cleanup runs in a finally block, which a hard kill never reaches. A ".part"
+// is by definition an incomplete mix that nothing ever reads, so once it's
+// old enough that nothing live could still be writing it, it counts as spent
+// bookkeeping too - otherwise a directory that is done in every other way
+// would never be removed. recover.js deletes these outright on the same
+// 1h age gate; this is the second, independent place that rule is applied,
+// for a directory that recover.js's own pass already left behind.
+const STALE_PART_MS = 60 * 60 * 1000;
+
 /**
  * Remove a session directory once the only things left in it are the index
- * files above - never while any audio or transcript is still there. Shared
- * with recover.js so both cleanup paths obey exactly the same rule.
+ * files above (plus a long-stale ".part") - never while any audio or
+ * transcript is still there. Shared with recover.js so both cleanup paths
+ * obey exactly the same rule.
  */
 export async function removeIfSpent(dir) {
   const left = await fs.readdir(dir).catch(() => null);
   if (!left) return;
-  if (left.every((name) => INDEX_FILES.has(name))) {
-    await fs.rm(dir, { recursive: true, force: true }).catch(() => {});
+  for (const name of left) {
+    if (INDEX_FILES.has(name)) continue;
+    if (!/\.mp3\.part$/i.test(name)) return; // something real is still here
+    const stat = await fs.stat(path.join(dir, name)).catch(() => null);
+    // Not old enough to be sure it's abandoned rather than a live mix still
+    // writing it - leave the whole directory alone rather than guess.
+    if (!stat || Date.now() - stat.mtimeMs <= STALE_PART_MS) return;
   }
+  await fs.rm(dir, { recursive: true, force: true }).catch(() => {});
 }
 
-/** Session ids look like "2026-08-28_1603_CLOSERS" - recover back to a Date
- *  so a backlog file still files under the month it was actually recorded. */
+/** Session ids look like "2026-08-28_160312_CLOSERS" (or, from before seconds
+ *  were added to buildSessionId(), "2026-08-28_1603_CLOSERS") - recover back
+ *  to a Date so a backlog file still files under the month it was actually
+ *  recorded. */
 function startedAtFor(sessionId) {
-  const m = /^(\d{4})-(\d{2})-(\d{2})_(\d{2})(\d{2})_/.exec(sessionId);
+  const m = /^(\d{4})-(\d{2})-(\d{2})_(\d{2})(\d{2})(\d{2})?_/.exec(sessionId);
   if (!m) return new Date();
-  const [, y, mo, d, h, mi] = m;
-  return new Date(Number(y), Number(mo) - 1, Number(d), Number(h), Number(mi));
+  const [, y, mo, d, h, mi, se] = m;
+  return new Date(Number(y), Number(mo) - 1, Number(d), Number(h), Number(mi), Number(se ?? 0));
 }
 
 // A sweep with a real backlog behind a slow or failing remote takes three
@@ -86,6 +105,7 @@ async function runSweep({
   rcloneConfig,
   uploadRetries = 3,
   deleteLocalAfterUpload = false,
+  onUploadFailure,
 }) {
   if (!rcloneRemote) return; // nothing configured to upload to
 
@@ -131,6 +151,15 @@ async function runSweep({
       });
     } catch (err) {
       log.warn(`${entry.name}: backlog upload failed, will retry next sweep: ${err.message}`);
+      // Same failure mode as a live chunk's own upload (a dead token, a
+      // network outage) but previously surfaced only in this log line -
+      // nobody watching the disk fill up would ever see it. index.js wires
+      // this into the same throttled Discord notice finishRecording() uses.
+      if (onUploadFailure) {
+        try {
+          await onUploadFailure(entry.name, err);
+        } catch {}
+      }
       continue;
     }
 

@@ -50,16 +50,20 @@ const slots = config.tokens.map((token, i) => new Slot(i, token));
 const graceTimers = new Map(); // channelId -> timeout
 const joinCooldown = new Map(); // channelId -> ms timestamp; set after a failed join
 const joinRounds = new Map(); // channelId -> how many times joining has failed
-const abandoned = new Set(); // channelIds we have stopped trying, until a redeploy
+const abandonedUntil = new Map(); // channelId -> ms timestamp we won't try again before
 const joinInFlight = new Set(); // channelIds we are mid-join on, right now
 // A failing join is visible in Discord: the bot appears in the channel, sits
 // there, and vanishes. Retrying that forever is worse than not recording, so
 // the budget is fixed and small. Two tries per attempt, two attempts total,
-// widening pauses between them, and then the channel is abandoned for the life
-// of this process. Four appearances, worst case, and then silence.
+// widening pauses between them, and then the channel is abandoned for an
+// hour - long enough that a transient permissions glitch or a Discord outage
+// isn't retried into the ground, short enough that it heals itself without
+// anyone having to redeploy. Four appearances, worst case, then an hour of
+// silence, then a fresh round of attempts.
 const JOIN_ATTEMPTS = 2;
 const MAX_JOIN_ROUNDS = 2;
 const JOIN_BACKOFF_MS = [60_000, 300_000];
+const ABANDON_MS = 60 * 60 * 1000;
 const IDLE_SWEEP_MS = 15_000;
 
 // Running out of disk mid-call is the one failure that loses audio outright, so
@@ -79,6 +83,32 @@ let lastUploadFailWarn = 0;
 let evaluateQueued = false;
 
 const BACKLOG_SWEEP_MS = 15 * 60 * 1000;
+
+// What /health answers with. A gateway resume - which discord.js does on its
+// own, routinely - takes client.isReady() false for a few seconds while the
+// recorder carries on recording perfectly well. Reporting "down" for that is
+// a false alarm for whatever is watching the endpoint, so a drop is only
+// reported once it has outlasted a resume. A revoked token or a genuinely
+// stuck gateway lasts far longer than this and is still reported.
+const READY_GRACE_MS = 2 * 60 * 1000;
+let lastGatewayReadyMs = 0;
+
+/**
+ * True when at least one bot slot is logged in with its gateway up - or was,
+ * recently enough that this is a reconnect rather than an outage. Sampled on
+ * the idle sweep as well as on each /health request, so the grace is measured
+ * against real time rather than against how often anyone happens to ask.
+ */
+function gatewayReady() {
+  if (slots.some((s) => s.client.isReady())) {
+    lastGatewayReadyMs = Date.now();
+    return true;
+  }
+  // Never up at all yet: still starting, or every login failed. Not ready,
+  // and no grace to extend - this is exactly what a readiness probe is for.
+  if (!lastGatewayReadyMs) return false;
+  return Date.now() - lastGatewayReadyMs < READY_GRACE_MS;
+}
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -335,7 +365,15 @@ function scheduleEvaluate() {
 
 async function evaluate() {
   for (const channel of watchedChannels()) {
-    if (abandoned.has(channel.id)) continue;
+    const until = abandonedUntil.get(channel.id);
+    if (until) {
+      if (Date.now() < until) continue;
+      // The hour is up - give it a genuinely fresh round rather than just
+      // "one more try", in case whatever caused the original failure (a
+      // permissions sync, a Discord outage) is long gone by now.
+      abandonedUntil.delete(channel.id);
+      joinRounds.delete(channel.id);
+    }
     const people = humansIn(channel);
     if (diskPaused && !slotRecording(channel.id)) continue;
     const active = slotRecording(channel.id);
@@ -454,16 +492,16 @@ async function attemptRecording(channel) {
     joinRounds.set(channel.id, round);
 
     if (round >= MAX_JOIN_ROUNDS) {
-      abandoned.add(channel.id);
+      abandonedUntil.set(channel.id, Date.now() + ABANDON_MS);
       slot.log.error(
-        `giving up on #${channel.name}. It will not be tried again until this service is ` +
-          `redeployed - repeatedly appearing and vanishing in the channel is worse than not recording.`
+        `giving up on #${channel.name} for an hour - repeatedly appearing and vanishing in the ` +
+          `channel is worse than not recording. Will try again after that.`
       );
       await announce(channel, {
         title: 'Recording disabled for this channel',
         description:
           `**#${channel.name}** — could not be joined: ${lastErr.message}\n` +
-          `No further attempts will be made until the recorder is restarted.`,
+          `Will try again in an hour.`,
         color: 0xcc3333,
       });
       return;
@@ -587,22 +625,15 @@ async function finishRecording(slot, reason) {
     } catch (err) {
       slot.log.error(`upload failed, keeping local copy: ${err.message}`);
       // This is the disk-fill mechanism: if uploads keep failing (a dead
-      // token, a network outage) recordings just pile up locally with
-      // nothing but this log line to say why. Announce it too, but no more
-      // than once per 6h - a bad token fails every chunk, and nobody needs
-      // that in the notices channel every couple of hours.
-      if (Date.now() - lastUploadFailWarn > 6 * 3600_000) {
-        lastUploadFailWarn = Date.now();
-        await announce(session.channel, {
-          title: 'Uploads to Google Drive are failing',
-          description:
-            `**#${session.channel.name}** could not be uploaded: ${err.message}\n` +
-            `Nothing is lost - recordings stay on the server - but this will fill the disk if it ` +
-            `keeps happening. Check the rclone / Google Drive setup. It will retry automatically ` +
-            `once that's fixed.`,
-          color: 0xcc3333,
-        }).catch(() => {});
-      }
+      // token, a network outage) recordings just pile up locally. See
+      // announceUploadFailure() - shared with the backlog sweep, so the same
+      // dead token doesn't produce two separate streams of notices.
+      await announceUploadFailure(
+        `**#${session.channel.name}** could not be uploaded: ${err.message}\n` +
+          `Nothing is lost - recordings stay on the server - but this will fill the disk if it ` +
+          `keeps happening. Check the rclone / Google Drive setup. It will retry automatically ` +
+          `once that's fixed.`
+      );
     }
 
     if (config.deleteLocalAfterUpload && uploaded.uploaded.length >= files.length) {
@@ -700,20 +731,47 @@ function describeJoinFailure(slot, channel) {
 
 // ─── notices ──────────────────────────────────────────────────────────────
 
+/** @returns {Promise<boolean>} true only when a notice actually reached Discord. */
 async function announce(sourceChannel, { title, description, color, footer }) {
-  if (!config.logChannelId) return;
+  if (!config.logChannelId) return false;
   const client = slots[0]?.client;
-  if (!client) return;
+  if (!client) return false;
   try {
     const channel = await client.channels.fetch(config.logChannelId);
-    if (!channel?.isTextBased()) return;
+    if (!channel?.isTextBased()) return false;
     const embed = new EmbedBuilder().setTitle(title).setDescription(description).setColor(color);
     if (footer) embed.setFooter({ text: footer });
     embed.setTimestamp(new Date());
     await channel.send({ embeds: [embed] });
+    return true;
   } catch (err) {
     log.warn(`could not post to the notices channel: ${err.message}`);
+    return false;
   }
+}
+
+/**
+ * One throttled notice for "uploads are failing," shared by a live chunk's
+ * own upload (finishRecording, above) and the backlog sweep (backlog.js, via
+ * runBacklogSweep's onUploadFailure below) - a dead token or a Drive outage
+ * fails both the same way, and nobody needs two separate streams of notices
+ * about the same underlying problem every few hours.
+ */
+async function announceUploadFailure(description) {
+  if (Date.now() - lastUploadFailWarn <= 6 * 3600_000) return;
+  // Claim the window before awaiting, so two failures landing together can't
+  // both post; hand it back if nothing was actually delivered. The backlog
+  // sweep runs once at boot, before any slot has logged in, and a notice that
+  // never reached Discord must not buy six hours of silence from the next one
+  // that could have.
+  const previous = lastUploadFailWarn;
+  lastUploadFailWarn = Date.now();
+  const posted = await announce(null, {
+    title: 'Uploads to Google Drive are failing',
+    description,
+    color: 0xcc3333,
+  }).catch(() => false);
+  if (!posted) lastUploadFailWarn = previous;
 }
 
 // ─── housekeeping ─────────────────────────────────────────────────────────
@@ -850,7 +908,22 @@ async function main() {
       rcloneConfig: config.rcloneConfig,
       uploadRetries: config.uploadRetries,
       deleteLocalAfterUpload: config.deleteLocalAfterUpload,
-    }).catch((err) => backlogLog.warn(`sweep failed: ${err.message}`));
+      // A backlog file failing to upload again is the same silent-disk-fill
+      // risk as a live chunk's own upload failing - see announceUploadFailure().
+      onUploadFailure: (name, err) =>
+        announceUploadFailure(
+          `A previously finished recording (**${name}**) failed to upload again: ${err.message}\n` +
+            `Nothing is lost - it stays on the server - but this will fill the disk if it keeps ` +
+            `happening. Check the rclone / Google Drive setup. It will retry automatically once ` +
+            `that's fixed.`
+        ),
+    }).catch((err) => {
+      backlogLog.warn(`sweep failed: ${err.message}`);
+      announceUploadFailure(
+        `The backlog upload sweep itself failed to run: ${err.message}\nRecordings already on the ` +
+          `server are safe; this will be retried on the next sweep.`
+      ).catch(() => {});
+    });
 
   // Once at boot - only worth trying if the remote actually answered above -
   // and then on a timer regardless, so a token fixed an hour from now (or a
@@ -863,6 +936,11 @@ async function main() {
     port: config.statusPort,
     secret: config.companionSecret,
     getState: companionState,
+    // /health's readiness signal: at least one bot slot has actually logged
+    // in and its gateway connection is up. gatewayReady() reads the same
+    // Client#isReady() waitUntilReady() uses below, live on each request,
+    // with the short grace described where it is defined.
+    isReady: gatewayReady,
     log,
   });
 
@@ -952,7 +1030,11 @@ async function main() {
   // Events can be missed - a dropped gateway resume, a join during a restart, a
   // cooldown that expired while the channel sat unchanged. A cheap sweep over
   // the cache makes every one of those self-correcting instead of permanent.
-  setInterval(() => scheduleEvaluate(), IDLE_SWEEP_MS).unref?.();
+  setInterval(() => {
+    // Also the sampler behind /health's grace window - see gatewayReady().
+    gatewayReady();
+    scheduleEvaluate();
+  }, IDLE_SWEEP_MS).unref?.();
 
   const shutdown = async (signal) => {
     log.info(`${signal} received - finishing any live recording before exit`);

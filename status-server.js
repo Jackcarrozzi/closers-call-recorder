@@ -1,4 +1,5 @@
-// A tiny status endpoint so the Windows companion knows when to roll video.
+// A tiny status endpoint so the Windows companion knows when to roll video,
+// plus a public /health readiness probe for the host platform (Railway etc).
 //
 // The bot can see that somebody has started a screen share - Discord exposes
 // that as a flag on their voice state - it just can't see the pixels. Those
@@ -7,18 +8,44 @@
 
 import http from 'node:http';
 
-export function startStatusServer({ port, secret, getState, log }) {
+/**
+ * @param {object} opts
+ * @param {number} opts.port
+ * @param {string} [opts.secret]      gates /status only - see below
+ * @param {() => object} opts.getState
+ * @param {() => boolean} [opts.isReady]  true once at least one bot slot is
+ *   logged in and its gateway connection is ready - drives /health. Absent
+ *   or throwing counts as "not ready" rather than crashing the server.
+ * @param {object} opts.log
+ */
+export function startStatusServer({ port, secret, getState, isReady, log }) {
+  // /health has to work with no companion set up at all - a platform health
+  // check shouldn't depend on a variable that only exists for the Windows
+  // video companion. /status still needs the secret; without one, safeEqual()
+  // below can never match any key, so it stays locked shut on its own -
+  // no special-casing needed for that route.
   if (!secret) {
-    log.info('COMPANION_SECRET not set - status endpoint disabled, video capture off');
-    return null;
+    log.info('COMPANION_SECRET not set - /status (video companion) stays locked, but /health still starts');
   }
 
   const server = http.createServer((req, res) => {
     const url = new URL(req.url, 'http://localhost');
 
     if (url.pathname === '/health') {
-      res.writeHead(200, { 'content-type': 'application/json' });
-      return res.end(JSON.stringify({ ok: true }));
+      let ready = false;
+      try {
+        ready = Boolean(isReady?.());
+      } catch (err) {
+        log.warn(`/health readiness check threw: ${err.message}`);
+      }
+      if (ready) {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        return res.end(JSON.stringify({ ok: true, ready: true }));
+      }
+      res.writeHead(503, { 'content-type': 'application/json' });
+      return res.end(
+        JSON.stringify({ ok: false, reason: 'no bot slot is logged in and ready' })
+      );
     }
 
     if (url.pathname !== '/status') {

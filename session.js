@@ -35,6 +35,7 @@ export class RecordingSession extends EventEmitter {
     this.startedAt = new Date();
     this.startMs = Date.now();
     this.stoppedAt = null;
+    this.dataDir = dataDir;
     this.id = buildSessionId(this.startedAt, channel.name);
     this.dir = path.join(dataDir, 'sessions', this.id);
     this.tracks = new Map(); // userId -> SpeakerTrack
@@ -47,6 +48,11 @@ export class RecordingSession extends EventEmitter {
     this.checkpointTimer = null;
     this.checkpointFile = path.join(this.dir, 'checkpoint.json');
     this.checkpointing = false;
+    // Only true once #claimDir() has actually reserved this.dir for us. Until
+    // then the path is just a guess at a name, and may well belong to another
+    // session - discard() must not delete a directory this session never
+    // created.
+    this.dirClaimed = false;
   }
 
   /**
@@ -70,15 +76,32 @@ export class RecordingSession extends EventEmitter {
     if (this.checkpointTimer) clearInterval(this.checkpointTimer);
     this.#destroyQuietly();
     this.connection = null;
-    await fs.rm(this.dir, { recursive: true, force: true }).catch(() => {});
+    // Never remove a directory we did not reserve: if the claim itself failed,
+    // this.dir still holds the un-claimed name, which on a same-second
+    // collision is another, live session's directory.
+    if (this.dirClaimed) await fs.rm(this.dir, { recursive: true, force: true }).catch(() => {});
   }
 
   get durationMs() {
     return (this.stoppedAt ? this.stoppedAt.getTime() : Date.now()) - this.startMs;
   }
 
+  /**
+   * Reserve this session's directory, exclusively - see claimSessionDir()
+   * below for why and how. Broken out into a standalone export rather than
+   * kept entirely inline so the collision behaviour can be exercised
+   * directly, without needing a real voice connection to reach it.
+   */
+  async #claimDir() {
+    const { id, dir } = await claimSessionDir(this.dataDir, this.id, this.log);
+    this.id = id;
+    this.dir = dir;
+    this.checkpointFile = path.join(dir, 'checkpoint.json');
+    this.dirClaimed = true;
+  }
+
   async start() {
-    await fs.mkdir(this.dir, { recursive: true });
+    await this.#claimDir();
 
     // Clearing a leftover voice session is the caller's job now - it has to
     // happen before we get this far, and it needs the gateway rather than the
@@ -259,25 +282,83 @@ export class RecordingSession extends EventEmitter {
     if (member?.user?.bot) return; // never record other bots
     const label = member?.displayName ?? member?.user?.username ?? `user-${userId}`;
 
-    const track = new SpeakerTrack({
-      userId,
-      label,
-      dir: this.dir,
-      sessionStart: this.startMs,
-    });
-    this.tracks.set(userId, track);
+    // Re-subscribing after a stream error (see forgetSubscription below) has
+    // to reuse this speaker's existing track. A second SpeakerTrack for the
+    // same user reopens speaker-<id>.pcm with 'w', which truncates every byte
+    // they had already said in this chunk, and replaces the burst index that
+    // says where that speech belongs - losing both the audio and the record
+    // of where it went. Carrying on with the same track is correct as well as
+    // safe: its stream is still open and appending, and burst offsets are
+    // measured from the session start, so the gap lands on the timeline by
+    // itself.
+    let track = this.tracks.get(userId);
+    if (!track) {
+      track = new SpeakerTrack({
+        userId,
+        label,
+        dir: this.dir,
+        sessionStart: this.startMs,
+      });
+      this.tracks.set(userId, track);
+    }
 
     // Manual end keeps one subscription open for the whole call; the stream
     // simply goes quiet between bursts of speech.
     const opus = receiver.subscribe(userId, { end: { behavior: EndBehaviorType.Manual } });
+
+    // Let go of the previous subscription, if this is a re-subscribe. When the
+    // receiver hands back the very same opus stream (it does, while that
+    // stream is still open) its listeners would otherwise accumulate a pair
+    // per re-subscribe - and only then, so a stream we are not about to
+    // re-arm is never left without an 'error' listener. A decoder still
+    // draining is destroyed either way: left running it would keep writing
+    // into this track alongside the new one, interleaving two streams of
+    // audio in the same file.
+    try {
+      if (track._opus === opus) track._detach?.();
+      track._decoder?.destroy();
+    } catch {}
+    track._detach = null;
+    track._decoder = null;
+
     const decoder = new prism.opus.Decoder({
       rate: PCM.sampleRate,
       channels: PCM.channels,
       frameSize: 960,
     });
 
-    opus.on('error', (err) => this.log.warn(`opus stream error for ${label}: ${err.message}`));
-    decoder.on('error', (err) => this.log.warn(`decode error for ${label}: ${err.message}`));
+    // Letting this user go on a later 'speaking start' is what fixes them
+    // going silent for the rest of the chunk if either stream errors or
+    // closes mid-call. It never causes churn on a clean stop(): stop()
+    // destroys these same streams on purpose, but #subscribe() bails out on
+    // this.stopping before it would ever act on the deleted entry.
+    //
+    // Only the newest subscription for a user may release the guard. A
+    // 'close' arriving late from a superseded stream would otherwise unlock a
+    // user who is already subscribed again, and the next 'speaking start'
+    // would attach a second decoder beside the live one - two copies of the
+    // same speech written into one track.
+    const generation = {};
+    track._generation = generation;
+    const forgetSubscription = () => {
+      if (track._generation !== generation) return;
+      this.subscribed.delete(userId);
+    };
+    const onOpusError = (err) => {
+      this.log.warn(`opus stream error for ${label}: ${err.message}`);
+      forgetSubscription();
+    };
+    opus.on('error', onOpusError);
+    opus.on('close', forgetSubscription);
+    track._detach = () => {
+      opus.off('error', onOpusError);
+      opus.off('close', forgetSubscription);
+    };
+    decoder.on('error', (err) => {
+      this.log.warn(`decode error for ${label}: ${err.message}`);
+      forgetSubscription();
+    });
+    decoder.on('close', forgetSubscription);
     decoder.on('data', (chunk) => track.write(chunk));
     opus.pipe(decoder);
 
@@ -345,10 +426,62 @@ export class RecordingSession extends EventEmitter {
   }
 }
 
+/**
+ * Reserve dataDir/sessions/<id> for a new session, exclusively. Two chunks -
+ * the tail of one ending and the head of the next starting - can still land
+ * in the same clock second on a fast machine even with buildSessionId()'s
+ * seconds resolution; a bare mkdir({recursive:true}) would silently hand the
+ * new chunk the old one's directory, and the old chunk's post-upload fs.rm()
+ * would then delete the live one out from under it. Plain mkdir() (no
+ * recursive) fails with EEXIST on a collision instead of succeeding
+ * quietly, so a taken name gets a numeric suffix and is tried again until
+ * one lands.
+ *
+ * The one thing a plain mkdir() gives up is creating sessions/ itself, which
+ * the old recursive call did for free. main() makes it at boot, but if it
+ * ever goes missing while we are running - a volume remount, a stray rm - a
+ * bare ENOENT here would fail every join until the next redeploy. So that one
+ * case rebuilds the parent and tries again, once.
+ */
+export async function claimSessionDir(dataDir, id, log) {
+  const root = path.join(dataDir, 'sessions');
+  let candidate = id;
+  let n = 2;
+  let rebuiltRoot = false;
+  for (;;) {
+    const dir = path.join(root, candidate);
+    try {
+      await fs.mkdir(dir);
+      if (candidate !== id) {
+        log?.warn?.(`session id ${id} was already in use - recording as ${candidate} instead`);
+      }
+      return { id: candidate, dir };
+    } catch (err) {
+      if (err.code === 'EEXIST') {
+        candidate = `${id}-${n++}`;
+        continue;
+      }
+      if (err.code === 'ENOENT' && !rebuiltRoot) {
+        rebuiltRoot = true;
+        log?.warn?.(`${root} was missing - recreating it`);
+        await fs.mkdir(root, { recursive: true });
+        continue;
+      }
+      throw err;
+    }
+  }
+}
+
 export function buildSessionId(date, channelName) {
   const pad = (n) => String(n).padStart(2, '0');
+  // Seconds, not just minutes: two chunks landing in the same clock minute
+  // (one ending, the next starting) used to build the identical id and
+  // therefore the identical directory. #claimDir() still uniquifies on a
+  // literal collision, but seconds make that a rare fallback instead of the
+  // normal case. Any old-format ("_HHmm_") id already on disk still parses
+  // fine everywhere it's read back - see backlog.js's startedAtFor().
   const stamp =
     `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}` +
-    `_${pad(date.getHours())}${pad(date.getMinutes())}`;
+    `_${pad(date.getHours())}${pad(date.getMinutes())}${pad(date.getSeconds())}`;
   return `${stamp}_${safeLabel(channelName)}`;
 }

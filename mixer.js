@@ -13,11 +13,38 @@ import { SpeakerTrack } from './tracks.js';
 
 const SILENCE_CHUNK = Buffer.alloc(PCM.bytesPerSecond); // 1s of silence, reused
 
+/**
+ * A write stream's 'error' event, if nothing is listening for it, is an
+ * uncaught exception that takes the whole process down - and stream.write()
+ * returning true (no backpressure) skips attaching any listener at all
+ * below, so a fifo whose reader (ffmpeg) has already died can still kill us
+ * on a write that never even hit the backpressure branch. This is the one
+ * listener that always exists, for the life of the stream, so that can never
+ * happen; it just remembers the error so the next write - or this one, if
+ * it's already in flight - can fail the feed cleanly instead.
+ */
+function armFeedErrors(stream) {
+  stream.on('error', (err) => {
+    if (!stream.feedError) stream.feedError = err;
+  });
+}
+
 function writeAsync(stream, buf) {
+  if (stream.feedError) return Promise.reject(stream.feedError);
   return new Promise((resolve, reject) => {
     if (stream.write(buf)) return resolve();
-    stream.once('drain', resolve);
-    stream.once('error', reject);
+    // Per-write, but always removed on settling either way - unlike a bare
+    // .once('error', reject) on every backpressured write, this can't pile
+    // up listeners over a long call's worth of writes.
+    const onDrain = () => settle(resolve);
+    const onError = (err) => settle(() => reject(err));
+    function settle(fn) {
+      stream.off('drain', onDrain);
+      stream.off('error', onError);
+      fn();
+    }
+    stream.once('drain', onDrain);
+    stream.once('error', onError);
   });
 }
 
@@ -33,6 +60,7 @@ async function writeSilence(stream, bytes) {
 /** Streams one speaker's timeline into a fifo: silence, speech, silence, speech... */
 async function feedTrack(track, fifoPath, durationMs) {
   const out = fs.createWriteStream(fifoPath);
+  armFeedErrors(out); // before anything can write to it - see armFeedErrors()
   const src = await fsp.open(track.file, 'r');
   let readPos = 0;
   let written = 0;
@@ -60,7 +88,12 @@ async function feedTrack(track, fifoPath, durationMs) {
     if (total > written) await writeSilence(out, total - written);
   } finally {
     await src.close();
-    await new Promise((resolve) => out.end(resolve));
+    // out.end()'s callback fires on 'finish', which a stream that has already
+    // errored (ffmpeg died, EPIPE) may never reach - awaiting it then would
+    // hang this feed forever instead of the clean rejection above.
+    // destroy() is the right way to close a stream that is already broken.
+    if (out.feedError) out.destroy();
+    else await new Promise((resolve) => out.end(resolve));
   }
 }
 
