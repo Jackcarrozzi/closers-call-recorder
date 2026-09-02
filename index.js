@@ -5,6 +5,38 @@
 // call down to a single mp3, optionally transcribes it, and files it in Drive.
 // Nobody has to be signed in, and nobody has to remember to press anything.
 
+// A BEST-EFFORT FALLBACK ONLY - the authoritative setting is `ENV
+// UV_THREADPOOL_SIZE=16` in the Dockerfile, which is what production
+// actually runs on (Railway builds the Dockerfile and starts it via
+// docker-entrypoint.sh -> `node index.js`; `npm start` is never involved,
+// so nothing in package.json's scripts would apply either).
+//
+// This line cannot be relied on by itself. libuv creates the threadpool
+// lazily and reads UV_THREADPOOL_SIZE once, at that moment - and in an ES
+// module every `import` below is hoisted and fully evaluated BEFORE this
+// statement runs. So discord.js, the native opus/sodium addons and our own
+// modules all get to run first, and the moment any of them touches the
+// threadpool the pool is already fixed at the default 4 and this assignment
+// is silently ignored. It happens to still take effect with today's
+// dependency graph (measured), but that is an accident of what those
+// packages do at import time, not a guarantee - which is exactly why the
+// real setting lives in the Dockerfile. Kept here so local `node index.js`
+// runs outside the container still get the wider pool.
+//
+// Every fs.* read/write - unlike a plain socket - always runs on that pool,
+// including the per-speaker fifo feeds in mixer.js. If ffmpeg (or its reader
+// side of a fifo) ever stops draining one, mixSession()'s watchdog still
+// makes the mix itself fail promptly, but the individual blocked write()
+// underneath is a kernel call already handed to a worker thread and cannot
+// be cancelled - it sits there until something eventually reads that pipe or
+// the process exits. Node's default pool is only 4 threads; four of these
+// stuck at once - one bad chunk with several corrupted speaker tracks is
+// enough - starves fs access for the ENTIRE process, not just the one mix,
+// which is what made the original incident look like the whole bot had
+// frozen rather than one mixdown. A bigger pool does not stop a leak, but it
+// buys a much wider margin before that leak can matter again.
+process.env.UV_THREADPOOL_SIZE ??= '16';
+
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { Client, GatewayIntentBits, ChannelType, EmbedBuilder } from 'discord.js';
