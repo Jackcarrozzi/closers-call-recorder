@@ -50,6 +50,7 @@ import { startStatusServer } from './status-server.js';
 import { recoverOrphanedSessions } from './recover.js';
 import { sweepBacklog } from './backlog.js';
 import { generateDependencyReport } from '@discordjs/voice';
+import { setupTodo } from './todo.js';
 
 const log = logger;
 
@@ -1030,6 +1031,14 @@ async function main() {
       await new Promise((r) => setTimeout(r, 30_000));
       process.exit(1);
     }
+  }
+
+  // /todo checklists ride on the first bot only, so the command shows up once.
+  // Fenced off completely: a problem here must never touch recording.
+  try {
+    setupTodo(slots[0].client, log.child('todo'));
+  } catch (err) {
+    log.warn(`to-do lists unavailable: ${err.message}`);
   }
 
   const channels = watchedChannels();
